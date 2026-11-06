@@ -71,7 +71,7 @@ LoGiN_UrL    = "https://loginbp.ppmainecoonghj.com/"
 
 # ── GUILD / BIO / AUTO-START ─────────────────────────────────────────────────
 DEFAULT_GUILD_ID         = "3087207343"
-DEFAULT_BIO              = "[C][B]WEB : MAHIR.XO.JE [FFD700]TG : MAHIR0208"
+DEFAULT_BIO              = "[C][B]WEB : MAHIR.XO.JE [FFD700]TG : torikul_1999"
 SETTINGS_FILE            = "bot_settings.json"
 AUTO_START_AFTER_CREATE  = True
 AUTO_START_DELAY         = 1.0
@@ -1172,7 +1172,7 @@ async def create_single_account(name_prefix, custom_bio=None, guild_id="", regio
         game_version = remote_v or app_version
         lang = _CR_REGION_LANG.get(region, "en")
 
-        bot_password = f"MAHIR_{_cr_rand_suffix(6)}"
+        bot_password = f"TORIKUL_{_cr_rand_suffix(6)}"
         uid = await _cr_register_account(bot_password, gop_1, app_version)
         if not uid:
             print("[-] register_account failed"); return None
@@ -1184,7 +1184,7 @@ async def create_single_account(name_prefix, custom_bio=None, guild_id="", regio
         platform = tok.get("platform", 4)
 
         major_payload, login_payload = await _cr_get_payload(access_token, open_id, platform, game_version, lang, region)
-        nickname_final = (f"{name_prefix}{_cr_rand_suffix(3)}" if name_prefix else f"MAHIR•{_cr_rand_suffix(5)}")
+        nickname_final = (f"{name_prefix}{_cr_rand_suffix(3)}" if name_prefix else f"TORIKUL•{_cr_rand_suffix(5)}")
 
         mr = await _cr_major_register(release_v, access_token, open_id, nickname_final, game_version, login_url, lang)
         if not mr:
