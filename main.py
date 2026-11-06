@@ -1,12 +1,15 @@
 # ═══════════════════════════════════════════════════════════════════════════
 #   main.py — UNIFIED BD (web panel + bot worker + CLI + auto creator)
-#   Multi-Squad: 1..12 independent squads, each plays its own match
+#   MULTI-SQUAD EDITION: 48 bots → 12 independent squads → 4 bots each
+#   Realistic movement: run → side → jump → prone → jump → run ...
 # ═══════════════════════════════════════════════════════════════════════════
 
 import os, sys, re, time, json, hmac, base64, uuid, random, math, struct, string, ssl
 import socket, asyncio, threading, hashlib, subprocess, requests, aiohttp
 from datetime import datetime
 from pathlib import Path
+from dataclasses import dataclass, field, asdict
+from typing import Optional
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -45,21 +48,26 @@ REGION_URLS = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   SECTION 2 — BOT CONFIG (BD)
+#   SECTION 2 — BOT CONFIG (BD) — MULTI-SQUAD
 # ═══════════════════════════════════════════════════════════════════════════
 REGION               = "BD"
 LANG                 = "en"
 LANG_CODE            = LANG
 ACCOUNTS_FILE        = "squad_accounts.json"
 DEVICES_FILE         = "device.json"
-TOTAL_ACCOUNTS       = 50
+
+# ── MULTI-SQUAD CONFIG ──────────────────────────────────────────────────────
+SQUAD_SIZE           = 4          # bots per squad
+MAX_SQUADS           = 12         # hard cap
+TOTAL_ACCOUNTS       = SQUAD_SIZE * MAX_SQUADS   # 48
+SQUAD_STATUS_FILE    = "squad_status.json"
+SQUAD_MONITOR_HZ     = 0.5
+SQUAD_RETRY_DELAY    = 5.0
+SQUAD_LOGIN_STAGGER  = 0.6
+SQUAD_ROUND_TIMEOUT  = 900.0
+SQUAD_TEAM_FILL_TIMEOUT = 90.0
+
 SETTLE_AFTER_ALL_JOIN= 1.5
-
-# ── MULTI-SQUAD ─────────────────────────────────────────────────────────────
-MAX_SQUADS           = 12       # hard cap — never exceeded
-MIN_SQUAD_MEMBERS    = 1        # a squad needs at least 1 player (solo squad allowed)
-DEFAULT_SQUAD_SIZE   = 4        # players per squad (master + slaves)
-
 FULL_STOP_SECONDS    = 5.0
 MATCH_MAX_LIFETIME   = 700.0
 MATCH_INFO_TIMEOUT   = 60.0
@@ -71,7 +79,7 @@ LoGiN_UrL    = "https://loginbp.ppmainecoonghj.com/"
 
 # ── GUILD / BIO / AUTO-START ─────────────────────────────────────────────────
 DEFAULT_GUILD_ID         = "3087207343"
-DEFAULT_BIO              = "[C][B]WEB : MAHIR.XO.JE [FFD700]TG : torikul_1999"
+DEFAULT_BIO              = "[C][B]WEB : MAHIR.XO.JE [FFD700]TG : MAHIR0208"
 SETTINGS_FILE            = "bot_settings.json"
 AUTO_START_AFTER_CREATE  = True
 AUTO_START_DELAY         = 1.0
@@ -93,10 +101,8 @@ CLIENT_URL   = REGION_URLS[REGION_GROUP.get(REGION, "OTHERS")]["client"]
 ACCOUNT_FILE = "Account.json"
 
 UDP_LOG_FILE = None
-_LOGIN_LOCK  = asyncio.Lock()
+_LOGIN_LOCKS: dict = {}
 CONTROL_FILE = "bot_control.json"
-# ── MULTI-SQUAD ADDITIONS ────────────────────────────────────────────────────
-SQUAD_PLAN_FILE = "squad_plan.json"   # {"squads": [[uid1,uid2],[uid3,uid4],...]}
 
 # ═══════════════════════════════════════════════════════════════════════════
 #   SECTION 3 — CRYPTO KEYS
@@ -1172,7 +1178,7 @@ async def create_single_account(name_prefix, custom_bio=None, guild_id="", regio
         game_version = remote_v or app_version
         lang = _CR_REGION_LANG.get(region, "en")
 
-        bot_password = f"TORIKUL_{_cr_rand_suffix(6)}"
+        bot_password = f"MAHIR_{_cr_rand_suffix(6)}"
         uid = await _cr_register_account(bot_password, gop_1, app_version)
         if not uid:
             print("[-] register_account failed"); return None
@@ -1184,7 +1190,7 @@ async def create_single_account(name_prefix, custom_bio=None, guild_id="", regio
         platform = tok.get("platform", 4)
 
         major_payload, login_payload = await _cr_get_payload(access_token, open_id, platform, game_version, lang, region)
-        nickname_final = (f"{name_prefix}{_cr_rand_suffix(3)}" if name_prefix else f"TORIKUL•{_cr_rand_suffix(5)}")
+        nickname_final = (f"{name_prefix}{_cr_rand_suffix(3)}" if name_prefix else f"MAHIR•{_cr_rand_suffix(5)}")
 
         mr = await _cr_major_register(release_v, access_token, open_id, nickname_final, game_version, login_url, lang)
         if not mr:
@@ -1225,12 +1231,10 @@ async def create_single_account(name_prefix, custom_bio=None, guild_id="", regio
                 print("[-] major_login (after choose_region) failed"); return None
             jwt_token = _gd(8); server_url = _gd(10); acc_id_raw = _gd(1)
 
-        # ── Bio ──
         bio_to_set = custom_bio if custom_bio else DEFAULT_BIO
         await asyncio.sleep(0.5)
         await _cr_change_bio(jwt_token, bio_to_set, server_url)
 
-        # ── Guild request + 1s wait ──
         if guild_id:
             await asyncio.sleep(1.0)
             await _cr_join_clan(jwt_token, guild_id)
@@ -2190,7 +2194,7 @@ async def movement_loop(sock, remote_addr, udp_key_b, match_code, state, stop_ev
         except Exception: pass
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   SECTION 14 — PLAY_GAME (UDP session)  ← unchanged, plays one account
+#   SECTION 14 — PLAY_GAME (UDP session)
 # ═══════════════════════════════════════════════════════════════════════════
 async def play_game(server_ip_port, prepare_packets, post_packet, udp_key, match_code,
                     account_id, player_region, client_version, tag="[?]",
@@ -2318,7 +2322,7 @@ async def play_game(server_ip_port, prepare_packets, post_packet, udp_key, match
     return reason
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   SECTION 15 — ACCOUNT LOGIN  ← unchanged
+#   SECTION 15 — ACCOUNT LOGIN
 # ═══════════════════════════════════════════════════════════════════════════
 GUEST_TOKEN_URL     = "https://100067.connect.garena.com/oauth/guest/token/grant"
 GUEST_CLIENT_SECRET = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
@@ -2338,6 +2342,14 @@ def _rand_ua():
     return (f"GarenaMSDK/{random.choice(_UA_VERSIONS)}"
             f"({random.choice(_UA_MODELS)};Android {random.choice(_UA_ANDROIDS)};"
             f"{random.choice(_UA_LANGS)};{random.choice(_UA_COUNTRY)};)")
+
+def _get_login_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lk = _LOGIN_LOCKS.get(loop)
+    if lk is None:
+        lk = asyncio.Lock()
+        _LOGIN_LOCKS[loop] = lk
+    return lk
 
 async def get_guest_token(uid, password, max_retries=6):
     headers = {
@@ -2391,7 +2403,7 @@ async def login_new_account(rec, cfg, tag, max_retries=6):
         rec["open_id"] = open_id; rec["access_token"] = access_token; rec["platform"] = platform
     platform = int(platform or 4)
     login = None; last_err = None
-    async with _LOGIN_LOCK:
+    async with _get_login_lock():
         for attempt in range(1, max_retries + 1):
             try:
                 login = await asyncio.to_thread(major_login, tag, open_id,
@@ -2428,7 +2440,7 @@ async def login_new_account(rec, cfg, tag, max_retries=6):
             "cfg": cfg_use, "lock_region": lock_reg or REGION}
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   SECTION 16 — SQUAD LOOPS (master / slave)  ← unchanged
+#   SECTION 16 — SQUAD LOOPS (master / slave)
 # ═══════════════════════════════════════════════════════════════════════════
 def collect_all_ints(obj, out):
     if isinstance(obj, dict):
@@ -2637,237 +2649,198 @@ async def master_loop(acct, slave_ids, holder, match_infos, start_evt, stop_evt,
 
 # ═══════════════════════════════════════════════════════════════════════════
 #   SECTION 17 — MULTI-SQUAD ORCHESTRATOR
-#   প্রতিটি স্কোয়াড আলাদাভাবে চলে। এক স্কোয়াডের UDP session অন্য স্কোয়াডের
-#   সাথে কখনও মেশে না। প্রতিটি স্কোয়াডের নিজের master/slaves/holder/match_infos।
 # ═══════════════════════════════════════════════════════════════════════════
-def setup_app_region():
-    global LANG_CODE, ACCOUNT_FILE, SERVER_URL, CLIENT_URL
-    LANG_CODE = LANG
-    ACCOUNT_FILE = f"{REGION}_Account.json"
-    grp = REGION_GROUP.get(REGION, REGION)
-    if grp in REGION_URLS:
-        SERVER_URL = REGION_URLS[grp]["server"]
-        CLIENT_URL = REGION_URLS[grp]["client"]
+@dataclass
+class SquadStatus:
+    squad_id:     int
+    squad_name:   str
+    bots:         list
+    session_id:   str = ""
+    status:       str = "pending"
+    stage:        str = "waiting"
+    started_at:   Optional[float] = None
+    finished_at:  Optional[float] = None
+    match_server: str = ""
+    match_code:   str = ""
+    match_result: str = ""
+    error:        str = ""
+    retry_count:  int = 0
+    created_at:   float = field(default_factory=time.time)
 
+class SquadState:
+    def __init__(self, squad_id: int, tags: list, bots: list):
+        self.squad_id = squad_id
+        self.tags = tags
+        self.bots = bots
+        self.group_id = None
+        self.team_code = None
+        self.team_code_ready = asyncio.Event()
+        self.slave_joined = set()
+        self.master_id = None
+        self.match_infos = {}
+        self.stop_evt = asyncio.Event()
+        self.start_evt = asyncio.Event()
+        self.accounts = []
+        self.status = SquadStatus(
+            squad_id=squad_id,
+            squad_name=f"Squad {squad_id:02d}",
+            bots=[{"tag": t, "uid": str(b.get("uid", "")),
+                   "ingame_id": "", "name": b.get("name", "")}
+                  for t, b in zip(tags, bots)],
+            session_id=f"S{squad_id:02d}-{uuid.uuid4().hex[:8]}",
+        )
 
-def _chunk_accounts_into_squads(records, squad_count):
-    """
-    Split records into up to `squad_count` squads. Each squad is a list of
-    account records. Distribution is as even as possible. Never produces more
-    than `squad_count` squads (hard cap).
-    """
-    squad_count = max(1, min(int(squad_count), MAX_SQUADS))
-    n = len(records)
-    if n == 0: return []
-    squad_count = min(squad_count, n)  # can't have more squads than accounts
-    # Even distribution: first `r` squads get `base+1`, rest get `base`
-    base, r = divmod(n, squad_count)
-    squads, idx = [], 0
-    for s_i in range(squad_count):
-        size = base + (1 if s_i < r else 0)
-        squads.append(records[idx:idx + size])
-        idx += size
+    def set_status(self, **kw):
+        for k, v in kw.items():
+            if hasattr(self.status, k):
+                setattr(self.status, k, v)
+
+_STATUS_LOCK = threading.Lock()
+_ALL_SQUADS: list = []
+
+def _dump_squad_status():
+    with _STATUS_LOCK:
+        payload = {
+            "generated_at": datetime.now().isoformat(),
+            "total_squads": len(_ALL_SQUADS),
+            "squads": [
+                {**asdict(s.status), "bots": s.status.bots}
+                for s in _ALL_SQUADS
+            ],
+        }
+    tmp = SQUAD_STATUS_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, SQUAD_STATUS_FILE)
+    except Exception:
+        pass
+
+def chunk_accounts(records, size=SQUAD_SIZE, max_squads=MAX_SQUADS):
+    squads = []
+    for i in range(0, len(records), size):
+        chunk = records[i:i+size]
+        if len(chunk) < size:
+            break
+        squads.append(chunk)
+        if len(squads) >= max_squads:
+            break
     return squads
 
+def _squad_tag(squad_id: int, pos: int) -> str:
+    if pos == 0:
+        return f"M{squad_id:02d}"
+    return f"S{squad_id:02d}-{pos}"
 
-async def squad_runner(squad_index, squad_records, cfg, global_stop):
-    """
-    Runs ONE independent squad:
-      1. Log in each account in this squad (in parallel).
-      2. Designate account[0] as master, rest as slaves.
-      3. master_loop + slave_loop → team full → start.
-      4. Collect each account's MATCH info.
-      5. Play the match with play_game per account (separate UDP socket each).
-    All logs prefixed with [Q<idx>] so different squads don't get confused.
-    """
-    qtag = f"Q{squad_index}"
-    stop_evt = asyncio.Event()
-    async def _watch_global():
-        await global_stop.wait()
-        stop_evt.set()
-    watcher = asyncio.create_task(_watch_global())
+async def _wait_team_full(state: "SquadState", slave_ids: set, timeout: float = 60.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if state.slave_joined >= slave_ids and state.team_code:
+            return True
+        if state.stop_evt.is_set():
+            return False
+        await asyncio.sleep(0.5)
+    return False
 
-    try:
-        # ── 1. Login all squad accounts ─────────────────────────────────
-        print(f"\n{'━'*70}")
-        print(f"  {CY}{B}[{qtag}]{R}  starting squad with {len(squad_records)} account(s)")
-        print(f"{'━'*70}")
-        accounts = []
-        for i, rec in enumerate(squad_records):
-            role = "M" if i == 0 else f"S{i}"
-            tag = f"{qtag}/{role}"
-            try:
-                acct = await login_new_account(rec, cfg, tag)
-                print(f"[+] {tag} ingame_id={acct['ingame_id']} region={acct['lock_region']}")
-                accounts.append(acct)
-            except Exception as e:
-                print(f"[{tag}] ✘ login failed: {e}")
-                return {"squad": squad_index, "status": "login_failed", "error": str(e)}
-            await asyncio.sleep(0.4)
+async def _wait_match_info(state: "SquadState", expected_tags: list, timeout: float):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if all(t in state.match_infos for t in expected_tags):
+            return True
+        if state.stop_evt.is_set():
+            return False
+        await asyncio.sleep(0.5)
+    return False
 
-        if not accounts:
-            return {"squad": squad_index, "status": "no_accounts"}
+async def run_squad_round(state: "SquadState", cfg: dict):
+    sid = state.squad_id
+    tag0 = f"Q{sid:02d}"
+    print(f"\n{GN}{'═'*70}{R}")
+    print(f"{GN}{B}[{tag0}] Squad {sid:02d} — {SQUAD_SIZE} bots{R}")
+    print(f"{GN}{'═'*70}{R}")
 
-        master = accounts[0]
-        slaves = accounts[1:]
-        slave_ids = {int(s["ingame_id"]) for s in slaves}
-        squad_size = len(accounts)
+    state.set_status(status="login", stage="logging in",
+                     started_at=time.time(), error="")
+    accounts = []
+    for pos, (tag, rec) in enumerate(zip(state.tags, state.bots)):
+        state.set_status(stage=f"login {pos+1}/{SQUAD_SIZE}")
+        try:
+            acct = await login_new_account(rec, cfg, f"[{tag}]")
+            get_device_for_account(acct["ingame_id"])
+            accounts.append(acct)
+        except Exception as e:
+            raise RuntimeError(f"{tag} login failed: {e}") from e
+        state.status.bots[pos]["ingame_id"] = str(accounts[-1]["ingame_id"])
+        _dump_squad_status()
+        await asyncio.sleep(0.4)
 
-        # ── 2. Per-squad isolated state ────────────────────────────────
-        holder = {
-            "group_id": None, "team_code": None,
-            "team_code_ready": asyncio.Event(),
-            "slave_joined": set(),
-        }
-        match_infos = {}
+    state.accounts = accounts
+    master = accounts[0]
+    slaves = accounts[1:]
+    slave_ids = {int(s["ingame_id"]) for s in slaves}
+    state.master_id = int(master["ingame_id"])
+    state.set_status(status="forming", stage="creating squad")
 
-        slave_tasks = [asyncio.create_task(slave_loop(s, holder, match_infos, stop_evt))
-                       for s in slaves]
-        await asyncio.sleep(2.0 if slaves else 0.2)
-        master_task = asyncio.create_task(
-            master_loop(master, list(slave_ids), holder, match_infos,
-                        asyncio.Event(), stop_evt, squad_size))
-
-        # ── 3. Wait for team to fill ───────────────────────────────────
-        print(f"[{qtag}] waiting team full ({squad_size} players)…")
-        t0 = time.time()
-        while time.time() - t0 < 60:
-            if stop_evt.is_set() or global_stop.is_set(): break
-            if slave_ids.issubset(holder["slave_joined"]) and holder["team_code"]:
-                break
-            await asyncio.sleep(0.5)
-        print(f"[{qtag}] team full: slaves={sorted(holder['slave_joined'])} "
-              f"code={holder['team_code']}")
-
-        # Tell master to send START
-        master_task  # noqa
-
-        # Actually signal start via a fresh event
-        # (we pass a new Event into master_loop above — need to reuse it)
-        # Rebuild: master_loop requires start_evt; we reused asyncio.Event()
-        # but didn't keep a handle. Fix: create one and pass it.
-        # — Re-do the master task wiring cleanly below —
-        # (see fixed version in `squad_runner` — start_evt)
-        # To keep this comment honest, we re-create master task here.
-
-        # NOTE: To avoid the bug above, `start_evt` is created before master_loop
-        # in the real implementation (see below).
-        return {"squad": squad_index, "status": "BUG"}  # replaced below
-    finally:
-        watcher.cancel()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#   SECTION 17B — CLEAN MULTI-SQUAD RUNNER (authoritative implementation)
-# ═══════════════════════════════════════════════════════════════════════════
-async def run_one_squad(squad_index, squad_records, cfg, global_stop):
-    """
-    Clean, correct implementation of a single independent squad runner.
-    Returns dict: {squad, status, ...}
-    """
-    qtag = f"Q{squad_index}"
-    stop_evt  = asyncio.Event()
-    start_evt = asyncio.Event()
-
-    async def _watch_global():
-        await global_stop.wait()
-        stop_evt.set()
-    watcher = asyncio.create_task(_watch_global())
+    holder = {
+        "group_id": state.group_id,
+        "team_code": state.team_code,
+        "team_code_ready": state.team_code_ready,
+        "slave_joined": state.slave_joined,
+        "master_id": state.master_id,
+    }
+    slave_tasks = [
+        asyncio.create_task(
+            slave_loop(s, holder, state.match_infos, state.stop_evt),
+            name=f"{tag0}-slave-{s['tag']}")
+        for s in slaves
+    ]
+    await asyncio.sleep(2.0)
+    master_task = asyncio.create_task(
+        master_loop(master, list(slave_ids), holder, state.match_infos,
+                    state.start_evt, state.stop_evt, SQUAD_SIZE),
+        name=f"{tag0}-master")
 
     try:
-        # ── 1. Login ───────────────────────────────────────────────────
-        print(f"\n{'━'*70}")
-        print(f"  {CY}{B}[{qtag}]{R}  starting squad  members={len(squad_records)}")
-        print(f"{'━'*70}")
+        state.set_status(stage="waiting team full")
+        if not await _wait_team_full(state, slave_ids, timeout=SQUAD_TEAM_FILL_TIMEOUT):
+            raise RuntimeError("team did not fill within "
+                               f"{SQUAD_TEAM_FILL_TIMEOUT:.0f}s")
+        state.team_code = holder["team_code"]
+        state.group_id = holder["group_id"]
+        state.slave_joined = holder["slave_joined"]
+        state.set_status(
+            stage="team full — starting",
+            match_code=str(state.team_code or ""),
+            status="starting",
+        )
+        state.start_evt.set()
 
-        accounts = []
-        for i, rec in enumerate(squad_records):
-            role = "M" if i == 0 else f"S{i}"
-            tag = f"{qtag}/{role}"
-            try:
-                acct = await login_new_account(rec, cfg, tag)
-                print(f"[+] {tag} ingame_id={acct['ingame_id']} "
-                      f"region={acct['lock_region']}")
-                accounts.append(acct)
-            except Exception as e:
-                print(f"[{tag}] ✘ login failed: {e}")
-                return {"squad": squad_index, "status": "login_failed",
-                        "error": str(e)}
-            await asyncio.sleep(0.35)
+        expected = state.tags
+        state.set_status(stage="waiting match info")
+        if not await _wait_match_info(state, expected, MATCH_INFO_TIMEOUT):
+            missing = [t for t in expected if t not in state.match_infos]
+            raise RuntimeError(f"no MATCH info from {missing}")
 
-        if not accounts:
-            return {"squad": squad_index, "status": "no_accounts"}
+        state.set_status(status="in_match", stage="joining UDP")
 
-        master = accounts[0]
-        slaves = accounts[1:]
-        slave_ids = {int(s["ingame_id"]) for s in slaves}
-        squad_size = len(accounts)
-
-        # ── 2. Isolated per-squad state ────────────────────────────────
-        holder = {
-            "group_id":        None,
-            "team_code":       None,
-            "team_code_ready": asyncio.Event(),
-            "slave_joined":    set(),
-        }
-        match_infos = {}
-
-        # ── 3. Launch slave + master tasks ─────────────────────────────
-        slave_tasks = [
-            asyncio.create_task(slave_loop(s, holder, match_infos, stop_evt))
-            for s in slaves
-        ]
-        await asyncio.sleep(2.0 if slaves else 0.2)
-        master_task = asyncio.create_task(
-            master_loop(master, list(slave_ids), holder, match_infos,
-                        start_evt, stop_evt, squad_size))
-
-        # ── 4. Wait for team to be full ────────────────────────────────
-        print(f"[{qtag}] waiting team full ({squad_size} players)…")
-        t0 = time.time()
-        while time.time() - t0 < 60:
-            if stop_evt.is_set() or global_stop.is_set(): break
-            if slave_ids.issubset(holder["slave_joined"]) and holder["team_code"]:
-                break
-            await asyncio.sleep(0.5)
-        print(f"[{qtag}] team full: slaves={sorted(holder['slave_joined'])} "
-              f"code={holder['team_code']}")
-
-        # ── 5. Trigger START ───────────────────────────────────────────
-        start_evt.set()
-
-        # ── 6. Wait for MATCH info from every squad member ─────────────
-        expected = {a["tag"] for a in accounts}
-        deadline = time.time() + MATCH_INFO_TIMEOUT
-        while time.time() < deadline:
-            if stop_evt.is_set() or global_stop.is_set(): break
-            if expected.issubset(set(match_infos.keys())): break
-            await asyncio.sleep(0.5)
-
-        missing = expected - set(match_infos.keys())
-        if missing:
-            print(f"[{qtag}] ⚠ missing MATCH info: {sorted(missing)} — aborting squad")
-            stop_evt.set()
-            for t in slave_tasks + [master_task]: t.cancel()
-            await asyncio.gather(*slave_tasks, master_task, return_exceptions=True)
-            return {"squad": squad_index, "status": "no_match_info",
-                    "missing": sorted(missing)}
-
-        # ── 7. Play match — each account gets its own UDP socket ───────
-        print(f"[{qtag}] all MATCH info received — joining UDP")
         udp_tasks = []
         for a in accounts:
-            r5 = match_infos[a["tag"]]
+            r5 = state.match_infos[a["tag"]]
             def _u(v): return v.get("data") if isinstance(v, dict) else v
             server_ip_port = r5["2"]
             udp_key        = r5["3"]
             join_token     = r5["4"]
             match_code     = r5["42"]
-            real_match_id   = _u(r5.get("1") or 0) or 0
-            real_map_id     = _u(r5.get("6") or 1) or 1
-            real_game_mode  = _u(r5.get("7") or 15) or 15
-            real_match_mode = _u(r5.get("8") or 1) or 1
-            real_sleep_ms   = _u(r5.get("5") or 0) or 0
+            real_match_id  = _u(r5.get("1") or 0) or 0
+            real_map_id    = _u(r5.get("6") or 1) or 1
+            real_game_mode = _u(r5.get("7") or 15) or 15
+            real_match_mode= _u(r5.get("8") or 1) or 1
+            real_sleep_ms  = _u(r5.get("5") or 0) or 0
+
+            if a["tag"] == master["tag"]:
+                state.set_status(match_server=server_ip_port,
+                                 match_code=str(match_code))
+                _dump_squad_status()
 
             prepare_packets, post_packet = await build_join_match_startup(
                 join_token, udp_key, match_code,
@@ -2880,73 +2853,93 @@ async def run_one_squad(squad_index, squad_records, cfg, global_stop):
                 match_id=real_match_id, country="BD",
                 map_id=real_map_id, game_mode=real_game_mode,
                 match_mode=real_match_mode)
-            udp_tasks.append(asyncio.create_task(play_game(
-                server_ip_port, prepare_packets, post_packet, udp_key, match_code,
-                int(a["ingame_id"]), a.get("lock_region", REGION),
-                a["cfg"].get("remote_version", Play_Version),
-                tag=a["tag"], account_jwt=join_token, sleep_ms=real_sleep_ms)))
 
-        try:
-            results = await asyncio.gather(*udp_tasks, return_exceptions=True)
-            print(f"[{qtag}] match ended — results={results}")
-        except Exception as e:
-            print(f"[{qtag}] gather err: {e}")
+            udp_tasks.append(asyncio.create_task(
+                play_game(
+                    server_ip_port, prepare_packets, post_packet, udp_key,
+                    match_code, int(a["ingame_id"]),
+                    a.get("lock_region", REGION),
+                    a["cfg"].get("remote_version", Play_Version),
+                    tag=a["tag"], account_jwt=join_token,
+                    sleep_ms=real_sleep_ms),
+                name=f"{tag0}-udp-{a['tag']}"))
 
-        # ── 8. Teardown ────────────────────────────────────────────────
-        stop_evt.set()
-        for t in slave_tasks + [master_task]: t.cancel()
-        await asyncio.gather(*slave_tasks, master_task, return_exceptions=True)
+        state.set_status(stage="playing")
+        results = await asyncio.gather(*udp_tasks, return_exceptions=True)
+        state.set_status(status="ended", stage="match ended",
+                         finished_at=time.time(),
+                         match_result=str(results))
 
-        return {"squad": squad_index, "status": "done",
-                "members": [a["tag"] for a in accounts]}
-
-    except Exception as e:
-        print(f"[{qtag}] ✘ runner error: {e}")
-        return {"squad": squad_index, "status": "error", "error": str(e)}
     finally:
-        watcher.cancel()
+        state.stop_evt.set()
+        for t in slave_tasks + [master_task]:
+            t.cancel()
+        await asyncio.gather(*slave_tasks, *[master_task], return_exceptions=True)
 
+async def squad_worker(state: "SquadState", cfg: dict):
+    retry = 0
+    while True:
+        retry += 1
+        state.stop_evt.clear()
+        state.start_evt.clear()
+        state.team_code_ready = asyncio.Event()
+        state.slave_joined = set()
+        state.match_infos = {}
+        state.team_code = None
+        state.group_id = None
+        state.set_status(retry_count=retry - 1)
+        try:
+            await asyncio.wait_for(
+                run_squad_round(state, cfg),
+                timeout=SQUAD_ROUND_TIMEOUT)
+            state.set_status(status="ended", stage="round done")
+            print(f"{GN}[Q{state.squad_id:02d}] ✔ round finished — restarting in "
+                  f"{SQUAD_RETRY_DELAY:.0f}s{R}")
+        except asyncio.CancelledError:
+            state.set_status(status="stopped", stage="cancelled")
+            raise
+        except asyncio.TimeoutError:
+            state.set_status(status="error", error="round timeout",
+                             stage="timeout", finished_at=time.time())
+            print(f"{RD}[Q{state.squad_id:02d}] ✘ round timeout — retry {retry}{R}")
+        except Exception as e:
+            state.set_status(status="error", error=str(e),
+                             stage="error", finished_at=time.time())
+            print(f"{RD}[Q{state.squad_id:02d}] ✘ error: {e} — retry {retry}{R}")
+        _dump_squad_status()
+        state.stop_evt.set()
+        try:
+            await asyncio.wait_for(asyncio.sleep(SQUAD_RETRY_DELAY),
+                                   timeout=SQUAD_RETRY_DELAY + 1)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+def setup_app_region():
+    global LANG_CODE, ACCOUNT_FILE, SERVER_URL, CLIENT_URL
+    LANG_CODE = LANG
+    ACCOUNT_FILE = f"{REGION}_Account.json"
+    grp = REGION_GROUP.get(REGION, REGION)
+    if grp in REGION_URLS:
+        SERVER_URL = REGION_URLS[grp]["server"]
+        CLIENT_URL = REGION_URLS[grp]["client"]
 
 async def main():
-    """
-    Multi-squad entry point.
-      • Reads selected accounts from squad_accounts.json (already filtered by
-        selected_accounts.json if present).
-      • Splits into at most MAX_SQUADS squads (12).
-      • Each squad's member count = ceil(total / squad_count), even split.
-      • Runs all squads in parallel; each squad is fully isolated.
-    """
     if UDP_LOG_FILE is not None:
         try:
             with open(UDP_LOG_FILE, "w", encoding="utf-8") as f:
                 f.write(f"# UDP log — run at {datetime.now().isoformat()}\n")
-        except Exception: pass
+        except Exception:
+            pass
     setup_app_region()
     cfg = dict(HARDCODED_CONFIG)
     try:
-        if os.path.exists(CONTROL_FILE): os.remove(CONTROL_FILE)
-    except: pass
+        if os.path.exists(CONTROL_FILE):
+            os.remove(CONTROL_FILE)
+    except Exception:
+        pass
 
-    # ── Determine desired squad count ─────────────────────────────────
-    # Priority: squad_plan.json → env → fallback 1
-    desired_squads = 1
-    if os.path.exists(SQUAD_PLAN_FILE):
-        try:
-            with open(SQUAD_PLAN_FILE, "r", encoding="utf-8") as f:
-                plan = json.load(f)
-            desired_squads = int(plan.get("squad_count", 1))
-        except Exception as e:
-            print(f"[!] squad_plan.json read fail: {e}")
-    else:
-        try:
-            desired_squads = int(os.environ.get("SQUAD_COUNT", "1"))
-        except ValueError:
-            desired_squads = 1
-
-    desired_squads = max(1, min(int(desired_squads), MAX_SQUADS))
-    print(f"[*] desired squad count: {desired_squads} (cap {MAX_SQUADS})")
-
-    # ── Load accounts ─────────────────────────────────────────────────
     raw_records = load_generated_accounts()
     selected_file = "selected_accounts.json"
     if os.path.exists(selected_file):
@@ -2954,49 +2947,70 @@ async def main():
             with open(selected_file, "r", encoding="utf-8") as f:
                 selected_uids = {str(u) for u in json.load(f)}
             before = len(raw_records)
-            raw_records = [r for r in raw_records if str(r.get("uid")) in selected_uids]
-            print(f"[*] web panel filter: {len(raw_records)}/{before} accounts")
+            raw_records = [r for r in raw_records
+                           if str(r.get("uid")) in selected_uids]
+            print(f"[*] Web panel filter: {len(raw_records)}/{before} accounts selected")
         except Exception as e:
             print(f"[!] selected_accounts.json read fail: {e}")
 
-    if not raw_records:
-        print(f"[!] no accounts available — aborting")
+    if len(raw_records) < SQUAD_SIZE:
+        print(f"[!] need ≥{SQUAD_SIZE} accounts to form a squad, "
+              f"have {len(raw_records)}")
         return
 
-    # Cap total accounts at MAX_SQUADS * squad_size_hint
-    max_total = MAX_SQUADS * DEFAULT_SQUAD_SIZE
-    if len(raw_records) > max_total:
-        print(f"[*] capping accounts at {max_total} (cap = {MAX_SQUADS}×{DEFAULT_SQUAD_SIZE})")
-        raw_records = raw_records[:max_total]
+    if len(raw_records) > TOTAL_ACCOUNTS:
+        print(f"[*] cap to {TOTAL_ACCOUNTS} accounts")
+        raw_records = raw_records[:TOTAL_ACCOUNTS]
 
-    # ── Split into squads ─────────────────────────────────────────────
-    squads = _chunk_accounts_into_squads(raw_records, desired_squads)
-    print(f"[*] {len(raw_records)} account(s) → {len(squads)} squad(s)")
-    for i, sq in enumerate(squads):
-        print(f"    Q{i+1}: {len(sq)} member(s) "
-              f"({', '.join(str(r.get('uid')) for r in sq[:3])}"
-              f"{'…' if len(sq)>3 else ''})")
+    if len(raw_records) % SQUAD_SIZE != 0:
+        print(f"[!] warning: {len(raw_records)} records not divisible by "
+              f"{SQUAD_SIZE} — trailing bots will be skipped")
 
-    # ── Launch all squads in parallel ─────────────────────────────────
-    global_stop = asyncio.Event()
-    tasks = [
-        asyncio.create_task(run_one_squad(i + 1, sq, cfg, global_stop))
-        for i, sq in enumerate(squads)
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    print(f"\n{'█'*70}")
-    print(f"[*] ALL SQUADS DONE")
-    for r in results:
-        if isinstance(r, Exception):
-            print(f"   ✘ exception: {r}")
-        else:
-            print(f"   Q{r.get('squad')}: {r.get('status')}")
-    print(f"{'█'*70}\n")
-    print(f"[*] restarting loop in {RESTART_DELAY}s")
+    squads = chunk_accounts(raw_records, size=SQUAD_SIZE, max_squads=MAX_SQUADS)
+    squads = [s for s in squads if len(s) == SQUAD_SIZE]
 
+    global _ALL_SQUADS
+    _ALL_SQUADS = []
+    for sid, chunk in enumerate(squads, start=1):
+        tags = [_squad_tag(sid, pos) for pos in range(SQUAD_SIZE)]
+        _ALL_SQUADS.append(SquadState(sid, tags, chunk))
+
+    print(f"\n{CY}{B}{'═'*70}{R}")
+    print(f"{CY}{B}  MULTI-SQUAD ORCHESTRATOR{R}")
+    print(f"{CY}{B}{'═'*70}{R}")
+    print(f"  Total bots:   {WH}{len(raw_records)}{R}")
+    print(f"  Squads:       {WH}{len(_ALL_SQUADS)}{R} × {SQUAD_SIZE} bots")
+    print(f"  Status file:  {D}{SQUAD_STATUS_FILE}{R}")
+    print(f"{CY}{B}{'═'*70}{R}\n")
+    _dump_squad_status()
+
+    tasks = []
+    for st in _ALL_SQUADS:
+        tasks.append(asyncio.create_task(
+            squad_worker(st, cfg),
+            name=f"squad-{st.squad_id:02d}"))
+        await asyncio.sleep(SQUAD_LOGIN_STAGGER)
+
+    async def _monitor():
+        while True:
+            _dump_squad_status()
+            await asyncio.sleep(SQUAD_MONITOR_HZ)
+    monitor_task = asyncio.create_task(_monitor(), name="squad-monitor")
+
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except Exception:
+            pass
+        _dump_squad_status()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   SECTION 18 — VERSION UPDATER  ← unchanged
+#   SECTION 18 — VERSION UPDATER
 # ═══════════════════════════════════════════════════════════════════════════
 def get_freefire_update_info():
     url = "https://play.google.com/store/apps/details?id=com.dts.freefireth&hl=ar&gl=DZ"
@@ -3032,15 +3046,16 @@ def update_versions():
     print(f"✅ Version updated: Play_Version={PlAy_VeR}  Ob_VeR={Ob_VeR_new}")
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   SECTION 19 — WEB PANEL (multi-squad aware)
+#   SECTION 19 — WEB PANEL
 # ═══════════════════════════════════════════════════════════════════════════
 BASE_DIR          = Path(__file__).parent.resolve()
 WEB_ACCOUNTS_FILE = BASE_DIR / "squad_accounts.json"
 WEB_SELECTED_FILE = BASE_DIR / "selected_accounts.json"
 WEB_LOG_FILE      = BASE_DIR / "bot.log"
+WEB_SQUAD_STATUS  = BASE_DIR / SQUAD_STATUS_FILE
 INDEX_FILE        = BASE_DIR / "index.html"
 
-app = FastAPI(title="Bot Squad Panel — BD (Multi-Squad)")
+app = FastAPI(title="Bot Squad Panel — BD")
 _worker_process    = None
 _worker_log_handle = None
 _worker_started_at = None
@@ -3075,29 +3090,17 @@ def _worker_log_reader(process, log_handle):
         log_handle.write(text); log_handle.flush()
         print(text, end='', flush=True)
 
-
-def _spawn_bot_worker(uids, squad_count):
-    """
-    Spawn bot worker with a specific squad count. Enforces MAX_SQUADS.
-    Writes squad_plan.json with {"squad_count": N} so worker knows how many
-    squads to create. Writes selected_accounts.json with the chosen uids.
-    """
+def _spawn_bot_worker(uids):
     global _worker_process, _worker_log_handle, _worker_started_at, _worker_log_thread
     if _web_is_running():
         return None
-    if not uids:
+    if not uids or len(uids) < SQUAD_SIZE:
         return None
-    squad_count = max(1, min(int(squad_count), MAX_SQUADS))
-    if squad_count > len(uids):
-        squad_count = len(uids)
     valid = {str(x.get("uid")) for x in _web_load_accounts()}
     chosen = [str(u) for u in uids if str(u) in valid]
-    if len(chosen) < 1:
+    if len(chosen) < SQUAD_SIZE:
         return None
     WEB_SELECTED_FILE.write_text(json.dumps(chosen), encoding="utf-8")
-    SQUAD_PLAN_FILE_W = BASE_DIR / "squad_plan.json"
-    SQUAD_PLAN_FILE_W.write_text(
-        json.dumps({"squad_count": squad_count, "uids": chosen}), encoding="utf-8")
     WEB_LOG_FILE.write_text("", encoding="utf-8")
     _worker_log_handle = open(WEB_LOG_FILE, "w", encoding="utf-8", buffering=1)
     _worker_started_at = time.time()
@@ -3112,10 +3115,10 @@ def _spawn_bot_worker(uids, squad_count):
     _worker_log_thread.start()
     return _worker_process.pid
 
-
 _BOT_STAGES = [
     ("login failed","error","login failed","red"),
     ("login ok","online","logged in","blue"),
+    ("assigned device","online","logging in","blue"),
     ("ONLINE auth sent","online","online","cyan"),
     ("joined squad","squad","in squad","yellow"),
     ("assumed joined","squad","in squad","yellow"),
@@ -3128,68 +3131,53 @@ _BOT_STAGES = [
 ]
 
 def _web_get_bot_status():
-    """
-    Returns per-bot status grouped by squad. Reads log for Q1, Q2, ... prefixes.
-    """
     selected = _web_load_selected()
     acc_map  = {str(a.get("uid")): a for a in _web_load_accounts()}
     log_lines = _web_read_log().split("\n")
     bots = []
     for i, uid in enumerate(selected):
         uid = str(uid)
-        tag = "M" if i == 0 else f"S{i}"
+        sid = (i // SQUAD_SIZE) + 1
+        pos = i % SQUAD_SIZE
+        tag = _squad_tag(sid, pos)
         acc = acc_map.get(uid, {})
-        bots.append({"uid": uid, "tag": tag,
+        bots.append({"uid": uid, "tag": tag, "squad": f"S{sid:02d}",
                      "name": acc.get("name", uid),
                      "ingame_id": acc.get("ingame_id", ""),
-                     "squad": 1,
                      "status": "idle", "stage": "waiting", "color": "gray",
                      "server": "", "match_code": ""})
     if not bots: return []
-    # Map each bot to its squad from the log
-    # Log tags look like "[Q1/M]" or "[Q2/S1]"
     for line in log_lines:
         if not line.strip(): continue
-        m = re.match(r"\[(Q\d+)/(M|S\d+)\]", line)
-        if m:
-            qidx = int(m.group(1)[1:])
-            role = m.group(2)
-            for bot in bots:
-                if bot["tag"] == role and bot["squad"] == 1:
-                    # Only assign once per role per squad
-                    pass
-    # Simpler: match by "[Q<n>/<role>]" substring
-    for bot in bots:
-        for line in log_lines:
-            if f"[Q{bot['squad']}/{bot['tag']}]" in line:
-                low = line.lower()
-                for kw, status, label, color in _BOT_STAGES:
-                    if kw.lower() in low:
-                        bot["status"] = status; bot["stage"] = label; bot["color"] = color
-                mm = re.search(r'ingame_id=(\d+)', line)
-                if mm: bot["ingame_id"] = mm.group(1)
-                mm = re.search(r'server=([\d\.]+:\d+)', line)
-                if mm: bot["server"] = mm.group(1)
-                mm = re.search(r'code=(\d+)', line)
-                if mm: bot["match_code"] = mm.group(1)
+        for bot in bots:
+            if f"[{bot['tag']}]" not in line: continue
+            low = line.lower()
+            for kw, status, label, color in _BOT_STAGES:
+                if kw.lower() in low:
+                    if bot["status"] == "ended" and status not in ("online","game"):
+                        if status != "error": continue
+                    bot["status"] = status; bot["stage"] = label; bot["color"] = color
+            m = re.search(r'login ok id=(\d+)', line)
+            if m: bot["ingame_id"] = m.group(1)
+            m = re.search(r'online=([\d\.]+:\d+)', line)
+            if m: bot["server"] = m.group(1)
+            m = re.search(r'server=([\d\.]+:\d+)', line)
+            if m: bot["server"] = m.group(1)
+            m = re.search(r'code=(\d+)', line)
+            if m: bot["match_code"] = m.group(1)
     return bots
-
 
 def _web_get_match_info():
     log_lines = _web_read_log().split("\n")
-    match = {"server": "", "code": "", "running": False, "started_at": None,
-             "squads": []}
+    match = {"server": "", "code": "", "running": False, "started_at": None}
     for line in log_lines:
-        m = re.search(r'\[Q(\d+)\].*server=([\d\.]+:\d+)\s+code=(\d+)', line)
+        m = re.search(r'server=([\d\.]+:\d+)\s+code=(\d+)', line)
         if m:
-            match["server"] = m.group(2); match["code"] = m.group(3)
+            match["server"] = m.group(1); match["code"] = m.group(2)
             match["running"] = True
-            if m.group(1) not in match["squads"]:
-                match["squads"].append(m.group(1))
-        if "MATCH_END received" in line or "ALL SQUADS DONE" in line:
+        if "MATCH_END received" in line or "MATCH DONE" in line:
             match["running"] = False
     return match
-
 
 @app.get("/")
 def index():
@@ -3197,16 +3185,13 @@ def index():
         return PlainTextResponse(f"index.html not found at {INDEX_FILE}", status_code=404)
     return FileResponse(INDEX_FILE)
 
-
 @app.get("/api/accounts")
 def api_accounts(): return _web_load_accounts()
-
 
 class NewAccount(BaseModel):
     uid: str
     password: str
     name: str = ""
-
 
 @app.post("/api/accounts")
 def api_add_account(a: NewAccount):
@@ -3220,10 +3205,8 @@ def api_add_account(a: NewAccount):
     _web_save_accounts(accts)
     return {"ok": True, "count": len(accts)}
 
-
 class BulkAddReq(BaseModel):
     lines: str
-
 
 @app.post("/api/accounts/bulk")
 def api_add_accounts_bulk(r: BulkAddReq):
@@ -3245,31 +3228,25 @@ def api_add_accounts_bulk(r: BulkAddReq):
     return {"ok": True, "added": len(added), "skipped": len(skipped),
             "bad": bad, "total": len(accts)}
 
-
 @app.delete("/api/accounts/{uid}")
 def api_del_account(uid: str):
     new = [x for x in _web_load_accounts() if str(x.get("uid")) != uid]
     _web_save_accounts(new)
     return {"ok": True, "count": len(new)}
 
-
 @app.post("/api/accounts/clear")
 def api_clear_accounts():
     _web_save_accounts([])
     return {"ok": True, "count": 0}
 
-
-# ── SETTINGS ────────────────────────────────────────────────────────────────
 class SettingsReq(BaseModel):
     guild_id:   str  = ""
     bio:        str  = ""
     auto_start: bool = True
 
-
 @app.get("/api/settings")
 def api_get_settings():
     return load_bot_settings()
-
 
 @app.post("/api/settings")
 def api_save_settings(s: SettingsReq):
@@ -3281,32 +3258,28 @@ def api_save_settings(s: SettingsReq):
     save_bot_settings(s2)
     return {"ok": True, **s2}
 
-
-# ── SSE AUTO-CREATE ─────────────────────────────────────────────────────────
 import queue as _queue
 from fastapi.responses import StreamingResponse
 
 _create_lock = threading.Lock()
 _create_running = False
 
-
-def _auto_create_worker(count, prefix, q, bio="", guild_id="", auto_start=True,
-                        squad_count=1):
+def _auto_create_worker(count, prefix, q, bio="", guild_id="", auto_start=True):
     global _create_running
     settings = load_bot_settings()
     if not bio:      bio      = settings.get("bio")        or DEFAULT_BIO
     if not guild_id: guild_id = settings.get("guild_id")   or DEFAULT_GUILD_ID
-    squad_count = max(1, min(int(squad_count), MAX_SQUADS))
 
     created_uids = []
     attempt = 0
+
     try:
         while len(created_uids) < count:
             attempt += 1
             current_target = len(created_uids) + 1
+
             q.put(json.dumps({"type": "progress", "done": len(created_uids),
-                              "msg": f"[{current_target}/{count}] Registering "
-                                     f"guest account... (Attempt {attempt})"}))
+                              "msg": f"[{current_target}/{count}] Registering guest account... (Attempt {attempt})"}))
             try:
                 result = asyncio.run(create_single_account(
                     name_prefix=prefix or None,
@@ -3343,49 +3316,41 @@ def _auto_create_worker(count, prefix, q, bio="", guild_id="", auto_start=True,
                     _web_save_accounts(web_accs)
 
                 created_uids.append(str(result["bot_uid"]))
-                q.put(json.dumps({"type": "ok", "done": len(created_uids),
-                                  "index": current_target,
+                q.put(json.dumps({"type": "ok", "done": len(created_uids), "index": current_target,
                                   "uid": str(result["bot_uid"]),
                                   "name": result["nickname"]}))
             except Exception as e:
-                q.put(json.dumps({"type": "fail", "index": current_target,
-                                  "error": str(e)}))
+                q.put(json.dumps({"type": "fail", "index": current_target, "error": str(e)}))
                 time.sleep(3)
 
             if len(created_uids) < count:
                 time.sleep(random.uniform(1.0, 2.0))
 
-        save_bot_settings({"guild_id": guild_id, "bio": bio,
-                           "auto_start": bool(auto_start)})
+        save_bot_settings({"guild_id": guild_id, "bio": bio, "auto_start": bool(auto_start)})
 
-        if auto_start and len(created_uids) >= 1:
+        if auto_start and len(created_uids) >= SQUAD_SIZE:
             q.put(json.dumps({"type": "progress", "done": len(created_uids),
-                              "msg": f"Waiting {AUTO_START_DELAY:.0f}s then "
-                                     f"starting {squad_count} squad(s)..."}))
+                              "msg": f"Waiting {AUTO_START_DELAY:.0f}s then starting gameplay..."}))
             time.sleep(AUTO_START_DELAY)
-            pid = _spawn_bot_worker(created_uids, squad_count)
+            pid = _spawn_bot_worker(created_uids)
             if pid:
                 q.put(json.dumps({"type": "auto_start", "pid": pid,
-                                  "count": len(created_uids),
-                                  "squads": squad_count}))
+                                  "count": len(created_uids)}))
             else:
                 q.put(json.dumps({"type": "progress", "done": len(created_uids),
                                   "msg": "⚠ Bot worker already running — skip auto-start"}))
 
-        q.put(json.dumps({"type": "done", "success": len(created_uids),
-                          "total": count, "squads": squad_count}))
+        q.put(json.dumps({"type": "done", "success": len(created_uids), "total": count}))
     except Exception as e:
         q.put(json.dumps({"type": "error", "error": str(e)}))
     finally:
         _create_running = False
 
-
 @app.get("/api/create")
 def api_auto_create(count: int = 4, prefix: str = "",
                     bio: str = "", guild_id: str = "",
-                    auto_start: bool = True, squad_count: int = 1):
+                    auto_start: bool = True):
     global _create_running
-    squad_count = max(1, min(int(squad_count), MAX_SQUADS))
     with _create_lock:
         if _create_running:
             def _busy():
@@ -3397,7 +3362,7 @@ def api_auto_create(count: int = 4, prefix: str = "",
     q: "_queue.Queue" = _queue.Queue()
     t = threading.Thread(
         target=_auto_create_worker,
-        args=(count, prefix, q, bio, guild_id, auto_start, squad_count),
+        args=(count, prefix, q, bio, guild_id, auto_start),
         daemon=True,
     )
     t.start()
@@ -3411,34 +3376,24 @@ def api_auto_create(count: int = 4, prefix: str = "",
                 if ev.get("type") in ("done", "error"):
                     break
             except _queue.Empty:
-                yield "data: " + json.dumps({"type": "error",
-                                             "error": "timeout"}) + "\n\n"
+                yield "data: " + json.dumps({"type": "error", "error": "timeout"}) + "\n\n"
                 break
 
     return StreamingResponse(_stream(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache",
-                                      "X-Accel-Buffering": "no"})
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-
-# ── START / STOP ────────────────────────────────────────────────────────────
 class StartReq(BaseModel):
     uids: list
-    squad_count: int = 1
-
 
 @app.post("/api/start")
 def api_start(r: StartReq):
     if _web_is_running(): raise HTTPException(400, "বট ইতিমধ্যে চলছে")
-    if not r.uids: raise HTTPException(400, "কমপক্ষে ১টা বট লাগবে")
-    squad_count = max(1, min(int(r.squad_count), MAX_SQUADS))
-    if squad_count > len(r.uids):
-        raise HTTPException(400,
-            f"squad_count ({squad_count}) > accounts ({len(r.uids)})")
-    pid = _spawn_bot_worker(r.uids, squad_count)
+    if len(r.uids) < SQUAD_SIZE:
+        raise HTTPException(400, f"কমপক্ষে {SQUAD_SIZE}টা বট লাগবে (১টা squad)")
+    pid = _spawn_bot_worker(r.uids)
     if not pid: raise HTTPException(400, "spawn failed")
     return {"ok": True, "pid": pid, "count": len(r.uids),
-            "squads": squad_count, "started_at": _worker_started_at}
-
+            "squads": (len(r.uids) // SQUAD_SIZE), "started_at": _worker_started_at}
 
 @app.post("/api/stop")
 def api_stop():
@@ -3452,12 +3407,13 @@ def api_stop():
         try: _worker_log_handle.close()
         except Exception: pass
         _worker_log_handle = None
-    for f in (WEB_SELECTED_FILE, BASE_DIR / "squad_plan.json", Path(CONTROL_FILE)):
-        try:
-            if f.exists(): f.unlink()
+    if WEB_SELECTED_FILE.exists():
+        try: WEB_SELECTED_FILE.unlink()
         except Exception: pass
+    if os.path.exists(CONTROL_FILE):
+        try: os.remove(CONTROL_FILE)
+        except: pass
     return {"ok": True}
-
 
 @app.post("/api/control")
 async def api_control(cmd: dict):
@@ -3465,19 +3421,26 @@ async def api_control(cmd: dict):
         Path(CONTROL_FILE).write_text(json.dumps(cmd)); return {"ok": True}
     except Exception as e: raise HTTPException(500, str(e))
 
-
 @app.get("/api/status")
 def api_status():
     return {"running": _web_is_running(),
             "pid": _worker_process.pid if _web_is_running() else None,
             "started_at": _worker_started_at if _web_is_running() else None}
 
-
 @app.get("/api/bots")
 def api_bots():
     return {"bots": _web_get_bot_status(), "match": _web_get_match_info(),
             "running": _web_is_running(), "started_at": _worker_started_at}
 
+@app.get("/api/squads")
+def api_squads():
+    try:
+        p = Path(SQUAD_STATUS_FILE)
+        if not p.exists():
+            return {"squads": [], "total_squads": 0, "generated_at": None}
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {"squads": [], "total_squads": 0, "generated_at": None}
 
 @app.get("/api/log", response_class=PlainTextResponse)
 def api_log():
@@ -3485,38 +3448,26 @@ def api_log():
         d = _web_read_log(); return "\n".join(d.splitlines()[-500:])
     except Exception: return ""
 
-
-@app.get("/api/squad-info")
-def api_squad_info():
-    """Returns the current squad plan and the max-squad cap."""
-    plan = None
-    plan_file = BASE_DIR / "squad_plan.json"
-    if plan_file.exists():
-        try: plan = json.loads(plan_file.read_text(encoding="utf-8"))
-        except Exception: pass
-    return {"max_squads": MAX_SQUADS, "plan": plan,
-            "running": _web_is_running()}
-
-
 def start_web_panel():
     import uvicorn
     PORT = int(os.environ.get("PORT", 8080))
     print(f"{CY}{B}╔══════════════════════════════════════════════════════════════════╗{R}")
-    print(f"{CY}{B}║{R}  {WH}{B}🎮  BOT SQUAD BD  ·  WEB PANEL (Multi-Squad ≤{MAX_SQUADS}){R}")
+    print(f"{CY}{B}║{R}  {WH}{B}🎮  BOT SQUAD BD  ·  MULTI-SQUAD WEB PANEL{R}")
     print(f"{CY}{B}╠══════════════════════════════════════════════════════════════════╣{R}")
     print(f"{CY}{B}║{R}  {D}local{R}    →  {GN}http://localhost:{PORT}{R}")
     print(f"{CY}{B}║{R}  {D}host{R}     →  {GN}http://0.0.0.0:{PORT}{R}")
+    print(f"{CY}{B}║{R}  {D}squads{R}   →  {WH}{SQUAD_SIZE} bots × {MAX_SQUADS} squads = {TOTAL_ACCOUNTS} total{R}")
     print(f"{CY}{B}╚══════════════════════════════════════════════════════════════════╝{R}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   SECTION 19.5 — ACCOUNT CREATOR CLI  ← unchanged
+#   SECTION 19.5 — ACCOUNT CREATOR CLI
 # ═══════════════════════════════════════════════════════════════════════════
 def create_accounts_cli():
     print(f"\n{CY}{B}╔══════════════════════════════════════════════════════════════════╗{R}")
-    print(f"{CY}{B}║{R}  {WH}{B}🎮  BD ACCOUNT CREATOR  ·  CLI MODE{R}")
+    print(f"{CY}{B}║{R}  {WH}{B}🎮  BD ACCOUNT CREATOR  ·  CLI MODE  (Multi-Squad){R}")
     print(f"{CY}{B}╠══════════════════════════════════════════════════════════════════╣{R}")
-    print(f"{CY}{B}║{R}  {D}region{R}={MG}{REGION}{R}")
+    print(f"{CY}{B}║{R}  {D}region{R}={MG}{REGION}{R}    {D}recommended{R}={WH}{TOTAL_ACCOUNTS}{R}")
     print(f"{CY}{B}╚══════════════════════════════════════════════════════════════════╝{R}\n")
 
     if not _cr_deps_ok():
@@ -3525,12 +3476,15 @@ def create_accounts_cli():
         return
 
     try:
-        raw = input(f"{CY}{B}How many accounts?{R} [default=4]: ").strip() or "4"
+        raw = input(f"{CY}{B}How many accounts?{R} [default={TOTAL_ACCOUNTS}]: ").strip() or str(TOTAL_ACCOUNTS)
         count = int(raw)
     except ValueError:
         print(f"{RD}✘ Invalid number{R}"); return
-    if count < 1 or count > 50:
-        print(f"{RD}✘ Count must be 1–50{R}"); return
+    if count < 1 or count > 200:
+        print(f"{RD}✘ Count must be 1–200{R}"); return
+
+    if count % SQUAD_SIZE != 0:
+        print(f"{YL}[!] {count} is not divisible by {SQUAD_SIZE}; trailing bots won't form squads{R}")
 
     prefix = input(f"{CY}{B}Name prefix{R} [optional, Enter=auto]: ").strip()
 
@@ -3594,12 +3548,12 @@ def create_accounts_cli():
         if i < count:
             time.sleep(random.uniform(1.0, 2.0))
 
-    save_bot_settings({"guild_id": guild_id, "bio": bio,
-                       "auto_start": s.get("auto_start", True)})
+    save_bot_settings({"guild_id": guild_id, "bio": bio, "auto_start": s.get("auto_start", True)})
     elapsed = time.time() - t_start
     print(f"\n{CY}{B}{'═'*60}{R}")
-    print(f"{GN}{B}[✓] Done:{R}  {GN}{success} success{R}  ·  "
-          f"{RD}{failed} failed{R}  ·  {elapsed:.1f}s")
+    print(f"{GN}{B}[✓] Done:{R}  {GN}{success} success{R}  ·  {RD}{failed} failed{R}  ·  {elapsed:.1f}s")
+    print(f"    Formable squads: {WH}{success // SQUAD_SIZE}{R} "
+          f"(leftover bots: {success % SQUAD_SIZE})")
     print(f"{CY}{B}{'═'*60}{R}\n")
 
 # ═══════════════════════════════════════════════════════════════════════════
