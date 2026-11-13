@@ -87,9 +87,9 @@ AUTO_MOVE_RUN_SPEED       = 700               # শুরুতে দৌড়া�
 AUTO_MOVE_BOOST_SPEED     = 900               # কিছুক্ষণ দৌড়ানোর পর আরও বেশি স্পিড
 AUTO_MOVE_BOOST_AFTER     = 1.2               # দৌড় শুরু করার কত সেকেন্ড পর BOOST_SPEED চালু হবে
 AUTO_MOVE_RUN_CHANCE      = 0.95              # ৯৫% সময় দৌড়াবে, শুধু ৫% সময় হাঁটবে (সবসময় দৌড়াতে 1.0 দিন)
-AUTO_MOVE_RADIUS          = 9000              # স্পন পয়েন্টের চারপাশে ঘোরার এরিয়া
+AUTO_MOVE_RADIUS          = 9000              # স্পন পয়েন্টের চারপাশে ঘোরার এরিয়া
 AUTO_MOVE_MIN_LEG         = 2500              # প্রতিবার কমপক্ষে কত দূরত্ব দৌড়াবে
-AUTO_MOVE_TURN_PER_TICK   = 45.0              # দ্রুত মোড় নেওয়ার স্পিড (degrees)
+AUTO_MOVE_TURN_PER_TICK   = 45.0              # দ্রুত মোড় নেওয়ার স্পিড (degrees)
 AUTO_MOVE_PAUSE_RANGE     = (0.0, 0.0)        # গন্তব্যে পৌঁছে বিরতি (একটানা দৌড়াতে (0.0, 0.0) দিন)
 AUTO_MOVE_RESYNC_DISTANCE = 2500              # server pos this far from every recent sent pos -> resync
 AUTO_MOVE_PIGGYBACK_ACK   = True              # ack reliable server packets inside 2001 (flags=4)
@@ -350,13 +350,14 @@ class BotState:
         except Exception: pass
 
     def register_account(self, uid, nickname, region="ID", level=1, exp=0,
-                         likes=0, token=None, auth_uid=None):
+                         likes=0, token=None, auth_uid=None, squad_id="A"):
         uid = str(uid)
         existing = self.accounts.get(uid, {})
         self.accounts[uid] = {
             "uid": uid, "nickname": nickname, "region": region,
             "level": level, "exp": exp, "likes": likes,
             "token": token, "auth_uid": auth_uid,
+            "squad_id": (squad_id or "A").upper(),
             "status": "ONLINE", "current_exp": exp,
             "initial_exp": existing.get("initial_exp", exp),
             "gained_exp": existing.get("gained_exp", 0),
@@ -419,7 +420,46 @@ class BotState:
 
 bot_state = BotState()
 
-_team_state = {"peers": {}, "leader_uid": None, "team_code": None, "lock": asyncio.Lock()}
+# ==================== MULTI-SQUAD TEAM STATE ====================
+_teams_state: Dict[str, dict] = {}
+
+def _get_team(group_id: str = "A") -> dict:
+    gid = str(group_id or "A").upper()
+    if gid not in _teams_state:
+        _teams_state[gid] = {
+            "peers": {}, "leader_uid": None, "team_code": None,
+            "lock": asyncio.Lock(),
+            "triggered": False, "squad_id": gid,
+        }
+    return _teams_state[gid]
+
+def _group_for_index(idx: int) -> str:
+    """4 জন = Group A, 4 জন = Group B ..."""
+    return chr(65 + (idx // TEAM_SIZE))
+
+def _all_teams_snapshot() -> List[dict]:
+    out = []
+    for gid in sorted(_teams_state.keys()):
+        t = _teams_state[gid]
+        out.append({
+            "group": gid, "size": len(t["peers"]),
+            "leader_uid": t["leader_uid"], "team_code": t["team_code"],
+            "members": list(t["peers"].keys()),
+        })
+    return out
+
+def _assign_squad_for_new_account() -> str:
+    """Smallest group letter with fewer than TEAM_SIZE accounts, else new group."""
+    counts: Dict[str, int] = {}
+    for a in bot_state.accounts.values():
+        gid = str(a.get("squad_id", "A") or "A").upper()
+        counts[gid] = counts.get(gid, 0) + 1
+    for i in range(26):
+        gid = chr(65 + i)
+        if counts.get(gid, 0) < TEAM_SIZE:
+            return gid
+    return "A"
+
 _restart_state = {"lock": asyncio.Lock(), "finished_bots": set(), "target": None, "restarting": False}
 
 # --- Homer Wire Builder ---
@@ -561,12 +601,12 @@ async def _mark_match_found(account_id=None):
 _ALLOWED_RESTART_STATUSES = {"ONLINE", "SEARCHING"}
 _team_stuck_state = {"lock": asyncio.Lock(), "in_team_since": {}, "triggered": False}
 
-async def _mark_team_joined(uid):
-    uid = str(uid)
+async def _mark_team_joined(uid, group_id="A"):
+    uid = str(uid); gid = str(group_id or "A").upper()
     async with _team_stuck_state["lock"]:
         if uid not in _team_stuck_state["in_team_since"]:
-            _team_stuck_state["in_team_since"][uid] = time.time()
-            print_info(f"[TEAM-STUCK] {uid} JOINED")
+            _team_stuck_state["in_team_since"][uid] = {"since": time.time(), "group": gid}
+            print_info(f"[TEAM-STUCK-{gid}] {uid} JOINED")
 
 async def _clear_team_joined(uid):
     uid = str(uid)
@@ -574,9 +614,12 @@ async def _clear_team_joined(uid):
         if uid in _team_stuck_state["in_team_since"]:
             del _team_stuck_state["in_team_since"][uid]
 
-async def _team_member_count() -> int:
-    async with _team_state["lock"]:
-        return len(_team_state["peers"])
+async def _team_member_count(group_id=None) -> int:
+    if group_id is None:
+        return sum(len(t["peers"]) for t in _teams_state.values())
+    t = _get_team(group_id)
+    async with t["lock"]:
+        return len(t["peers"])
 
 def _all_bots_are_online_or_searching() -> bool:
     active_statuses = []
@@ -609,29 +652,28 @@ async def _no_match_watchdog():
                     _no_match_state["global_last_match"] = time.time()
                 async with _team_stuck_state["lock"]:
                     now = time.time()
-                    for uid in list(_team_stuck_state["in_team_since"].keys()):
-                        _team_stuck_state["in_team_since"][uid] = now
+                    for info in _team_stuck_state["in_team_since"].values():
+                        info["since"] = now
                 continue
             now = time.time()
-            stuck_uids = []
-            team_size = await _team_member_count()
-            async with _team_stuck_state["lock"]:
-                for uid, since in list(_team_stuck_state["in_team_since"].items()):
-                    async with _team_state["lock"]:
-                        still_in_team = uid in _team_state["peers"]
-                    if not still_in_team:
-                        del _team_stuck_state["in_team_since"][uid]; continue
-                    if now - since >= NO_MATCH_RESTART_TIMEOUT:
-                        stuck_uids.append((uid, now - since))
-            if stuck_uids and team_size >= TEAM_SIZE and not _any_bot_in_match():
-                async with _team_stuck_state["lock"]:
-                    if _team_stuck_state["triggered"]: continue
-                    _team_stuck_state["triggered"] = True
-                msg = f"[TEAM-STUCK] {len(stuck_uids)} bot joined team no match ≥{NO_MATCH_RESTART_TIMEOUT:.0f}s"
-                print_warning(msg); bot_state.log(msg, "warning")
-                async with _restart_state["lock"]:
-                    _restart_state["restarting"] = True
-                await _schedule_restart(); return
+            # per-group stuck check
+            for gid in list(_teams_state.keys()):
+                team = _get_team(gid)
+                async with team["lock"]:
+                    if team["triggered"]: continue
+                    if not team["peers"]: continue
+                    stuck = sum(
+                        1 for uid, info in _team_stuck_state["in_team_since"].items()
+                        if info.get("group") == gid and uid in team["peers"]
+                        and now - info["since"] >= NO_MATCH_RESTART_TIMEOUT
+                    )
+                    if stuck and len(team["peers"]) >= TEAM_SIZE:
+                        team["triggered"] = True
+                        msg = f"[TEAM-STUCK-{gid}] {stuck} bot no match ≥{NO_MATCH_RESTART_TIMEOUT:.0f}s"
+                        print_warning(msg); bot_state.log(msg, "warning")
+                        async with _restart_state["lock"]:
+                            _restart_state["restarting"] = True
+                        await _schedule_restart(); return
             if not _all_bots_are_online_or_searching():
                 async with _no_match_state["lock"]:
                     _no_match_state["global_last_match"] = time.time()
@@ -1084,7 +1126,7 @@ class MoveState:
             if self.pending_ack is None or ((oid - self.pending_ack) & 0xFFFF) < 0x8000:
                 self.pending_ack = oid
 
-        # --- Cmd 101 থেকে Player ID পড়া ---
+        # --- Cmd 101 থেকে Player ID পড়া ---
         if frame["cmd"] == 101:
             c = frame.get("content") or b""
             try:
@@ -1232,7 +1274,7 @@ async def auto_move_loop(sock, ip, port, key_bytes, mask, state, stop_event, lab
         pose = 0
         if target is not None:
             # প্রথমে ফাস্ট স্পিডে (AUTO_MOVE_RUN_SPEED) শুরু করে,
-            # AUTO_MOVE_BOOST_AFTER সেকেন্ড পর আরও বেশি স্পিডে (AUTO_MOVE_BOOST_SPEED) দৌড়াবে
+            # AUTO_MOVE_BOOST_AFTER সেকেন্ড পর আরও বেশি স্পিডে (AUTO_MOVE_BOOST_SPEED) দৌড়াবে
             if is_running and (now - leg_start_time) >= AUTO_MOVE_BOOST_AFTER:
                 current_speed = AUTO_MOVE_BOOST_SPEED
             else:
@@ -2727,7 +2769,8 @@ async def play_game_cs(server_ip_port, thunder, sharma, udp_key, match_code,
 
 # ==================== FUNCTIONAL LONE WOLF ====================
 async def functional_lone_wolf(addrs, starter_packet, account_region, client_version,
-                                key, iv, account_id="", account_data=None, max_reconnects=10):
+                                key, iv, account_id="", account_data=None, max_reconnects=10,
+                                squad_id="A"):
     reconnects = 0
     ip, port = addrs.split(":")
     play_matches: List[asyncio.Task] = []
@@ -2735,6 +2778,8 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     search_attempts = 0
     last_start_time = 0.0
     uid_str = str(account_id)
+    gid = str(squad_id or "A").upper()
+    team_state = _get_team(gid)
 
     current_token = starter_packet
     current_key = key; current_iv = iv
@@ -2836,21 +2881,21 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     async def _team_coordinator():
         try:
             while True:
-                async with _team_state["lock"]:
-                    n = len(_team_state["peers"])
+                async with team_state["lock"]:
+                    n = len(team_state["peers"])
                 if n >= TEAM_SIZE: break
                 if bot_state.is_paused(uid_str): return
                 await asyncio.sleep(0.5)
             await asyncio.sleep(TEAM_READY_DELAY)
-            async with _team_state["lock"]:
-                is_leader = (_team_state["leader_uid"] == uid_str)
-                peers_snapshot = dict(_team_state["peers"])
+            async with team_state["lock"]:
+                is_leader = (team_state["leader_uid"] == uid_str)
+                peers_snapshot = dict(team_state["peers"])
             if not is_leader:
-                print_info(f"TEAM {uid_str} waiting as member..."); return
-            print_premium(f"TEAM {uid_str} — creating {'CS' if CS_MODE_ENABLED else 'BR'} squad region={account_region}",
+                print_info(f"TEAM[{gid}] {uid_str} waiting as member..."); return
+            print_premium(f"TEAM[{gid}] {uid_str} — creating {'CS' if CS_MODE_ENABLED else 'BR'} squad region={account_region}",
                           color=PX.GOLD, icon=I["crown"])
-            async with _team_state["lock"]:
-                _team_state["team_code"] = None
+            async with team_state["lock"]:
+                team_state["team_code"] = None
             own_id_num = None
             if current_account_data: own_id_num = current_account_data.get('account_id')
             if not own_id_num:
@@ -2863,15 +2908,15 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                   sub_mode=6 if (CS_MODE_ENABLED and CS_RANKED_ENABLED) else 1)
                 if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                     _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
-                    print_info(f"TEAM create_team sent ({len(pkt)}B)")
-            except Exception as e: print_error(f"TEAM create_team err: {e}")
+                    print_info(f"TEAM[{gid}] create_team sent ({len(pkt)}B)")
+            except Exception as e: print_error(f"TEAM[{gid}] create_team err: {e}")
             await asyncio.sleep(1.5)
             try:
                 pkt = team_fresh(int(own_id_num), current_key, current_iv)
                 if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                     _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
-                    print_success(f"TEAM team_fresh #1 sent")
-            except Exception as e: print_warning(f"TEAM team_fresh err: {e}")
+                    print_success(f"TEAM[{gid}] team_fresh #1 sent")
+            except Exception as e: print_warning(f"TEAM[{gid}] team_fresh err: {e}")
             await asyncio.sleep(1.0)
             async def _invite_uid(target_uid, label=""):
                 for attempt in range(2):
@@ -2880,8 +2925,8 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                                     region=account_region)
                         if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                             _writer_ref["w"].write(inv); await _writer_ref["w"].drain()
-                            print_info(f"TEAM invite{label} → {target_uid} #{attempt+1}")
-                    except Exception as e: print_warning(f"TEAM invite err: {e}")
+                            print_info(f"TEAM[{gid}] invite{label} → {target_uid} #{attempt+1}")
+                    except Exception as e: print_warning(f"TEAM[{gid}] invite err: {e}")
                     await asyncio.sleep(0.6)
             invite_count = 0
             for peer_uid, peer_info in peers_snapshot.items():
@@ -2890,7 +2935,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 try: peer_acc_id = peer_info["data"].get("account_id")
                 except Exception: pass
                 if not peer_acc_id: peer_acc_id = peer_uid
-                print_premium(f"TEAM Inviting bot{invite_count+2} {peer_acc_id}...",
+                print_premium(f"TEAM[{gid}] Inviting bot{invite_count+2} {peer_acc_id}...",
                               color=PX.CYAN, icon=I["arrow"])
                 await _invite_uid(int(peer_acc_id), f" bot{invite_count+2}")
                 invite_count += 1
@@ -2899,32 +2944,32 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 pkt = team_fresh(int(own_id_num), current_key, current_iv)
                 if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                     _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
-                    print_success(f"TEAM team_fresh #2 sent")
-            except Exception as e: print_warning(f"TEAM team_fresh #2 err: {e}")
+                    print_success(f"TEAM[{gid}] team_fresh #2 sent")
+            except Exception as e: print_warning(f"TEAM[{gid}] team_fresh #2 err: {e}")
             await asyncio.sleep(1.0)
-            print_premium(f"TEAM {uid_str} SQUAD READY → start match loop",
+            print_premium(f"TEAM[{gid}] {uid_str} SQUAD READY → start match loop",
                           color=PX.EMERALD, icon=I["rocket"])
             try: bot_state.update_status(uid_str, "SEARCHING", 0)
             except Exception: pass
             while _team_active["flag"] and not _match_played["flag"]:
                 try:
                     if bot_state.is_paused(uid_str): break
-                    async with _team_state["lock"]:
-                        if _team_state["leader_uid"] != uid_str: break
+                    async with team_state["lock"]:
+                        if team_state["leader_uid"] != uid_str: break
                     own_id = current_account_data.get('account_id', own_id_num) if current_account_data else own_id_num
                     try:
                         rdy = ready_for_game(int(own_id), current_key, current_iv)
                         if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                             _writer_ref["w"].write(rdy); await _writer_ref["w"].drain()
-                    except Exception as e: print_warning(f"TEAM ready err: {e}")
+                    except Exception as e: print_warning(f"TEAM[{gid}] ready err: {e}")
                     await asyncio.sleep(CS_TEAM_LEADER_DELAY if CS_MODE_ENABLED else 1.0)
                     sm = start_match_team(int(own_id), current_key, current_iv, region=account_region)
                     if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                         _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
                         if CS_MODE_ENABLED:
-                            print_info(f"TEAM CS leader {uid_str} start sent "
+                            print_info(f"TEAM[{gid}] CS leader {uid_str} start sent "
                                        f"(again after {CS_TEAM_START_RETRY:.0f}s without a match)")
-                except Exception as e: print_warning(f"TEAM start_match err: {e}")
+                except Exception as e: print_warning(f"TEAM[{gid}] start_match err: {e}")
                 if CS_MODE_ENABLED:
                     # CS: repeating start restarts the search — wait for the match instead
                     retry_at = time.time() + CS_TEAM_START_RETRY
@@ -2936,14 +2981,14 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 except asyncio.TimeoutError: pass
         except asyncio.CancelledError: raise
         except Exception as e:
-            print_error(f"TEAM coordinator error: {e}")
+            print_error(f"TEAM[{gid}] coordinator error: {e}")
 
     async def _member_match_trigger():
         try:
             await asyncio.sleep(TEAM_READY_DELAY + 18.0)
-            async with _team_state["lock"]:
-                if _team_state["leader_uid"] == uid_str: return
-            print_premium(f"TEAM Member {uid_str} ready loop",
+            async with team_state["lock"]:
+                if team_state["leader_uid"] == uid_str: return
+            print_premium(f"TEAM[{gid}] Member {uid_str} ready loop",
                           color=PX.SKY, icon=I["pulse"])
             try: bot_state.update_status(uid_str, "SEARCHING", 0)
             except Exception: pass
@@ -2955,12 +3000,12 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         try:
                             rdy = ready_for_game(int(my_id), current_key, current_iv)
                             _writer_ref["w"].write(rdy); await _writer_ref["w"].drain()
-                        except Exception as e: print_warning(f"TEAM member ready err: {e}")
+                        except Exception as e: print_warning(f"TEAM[{gid}] member ready err: {e}")
                         await asyncio.sleep(1.0)
                         if not CS_MODE_ENABLED or CS_TEAM_MEMBERS_START:
                             sm = start_match_team(int(my_id), current_key, current_iv, region=account_region)
                             _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
-                except Exception as e: print_warning(f"TEAM member trigger: {e}")
+                except Exception as e: print_warning(f"TEAM[{gid}] member trigger: {e}")
                 if CS_MODE_ENABLED:
                     retry_at = time.time() + CS_TEAM_START_RETRY
                     while (time.time() < retry_at and _team_active["flag"] and not _match_played["flag"]
@@ -2971,7 +3016,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 except asyncio.TimeoutError: pass
         except asyncio.CancelledError: raise
         except Exception as e:
-            print_warning(f"TEAM member trigger outer: {e}")
+            print_warning(f"TEAM[{gid}] member trigger outer: {e}")
 
     try:
         while True:
@@ -3020,20 +3065,20 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         except Exception: break
 
                 gateway_ping_task = asyncio.create_task(func_gateway_keepalive())
-                print_premium(f"TCP Gateway Connected | UID: {uid_str} | region={account_region}",
+                print_premium(f"TCP Gateway Connected | UID: {uid_str} | squad={gid} | region={account_region}",
                               color=PX.MINT, icon=I["check"])
                 reconnects = 0; no_response_count = 0
                 if ENABLE_NEWBIE_CHARACTER and NEWBIE_SELECT_BEFORE_TEAM:
                     print_warning("Newbie select diaktifkan — berisiko Connection lost!")
-                async with _team_state["lock"]:
-                    _team_state["peers"][uid_str] = {
+                async with team_state["lock"]:
+                    team_state["peers"][uid_str] = {
                         "writer": writer, "data": current_account_data,
                         "key": current_key, "iv": current_iv}
-                    if _team_state["leader_uid"] is None:
-                        _team_state["leader_uid"] = uid_str
-                        print_premium(f"TEAM {uid_str} is first peer (leader)",
+                    if team_state["leader_uid"] is None:
+                        team_state["leader_uid"] = uid_str
+                        print_premium(f"TEAM[{gid}] {uid_str} is first peer (leader)",
                                       color=PX.GOLD, icon=I["crown"])
-                try: await _mark_team_joined(uid_str)
+                try: await _mark_team_joined(uid_str, gid)
                 except Exception: pass
 
                 async def send_solo_start_match():
@@ -3055,7 +3100,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                                                             region=account_region)
                             if writer and not writer.is_closing():
                                 writer.write(cs_pkt); await writer.drain()
-                                print_premium(f"CS Solo matchmaking sent #{search_attempts} | region={account_region}",
+                                print_premium(f"CS Solo matchmaking sent #{search_attempts} | squad={gid} | region={account_region}",
                                               color=PX.AMBER, icon=I["target"])
                         else:
                             await start_game_battle_royale(account_region, client_version, writer, current_key, current_iv)
@@ -3112,9 +3157,9 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                 if cand and str(cand).isdigit() and len(str(cand)) == 7:
                                     tc = str(cand); break
                             if tc:
-                                async with _team_state["lock"]:
-                                    _team_state["team_code"] = tc
-                                print_premium(f"TEAM Code: {tc}", color=PX.ROSE, icon=I["gem"])
+                                async with team_state["lock"]:
+                                    team_state["team_code"] = tc
+                                print_premium(f"TEAM[{gid}] Code: {tc}", color=PX.ROSE, icon=I["gem"])
                             group_id = _f5g(8)
                             if group_id and isinstance(group_id, str) and 20 <= len(group_id) <= 40: pass
                             else: group_id = None
@@ -3126,8 +3171,8 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                 if cand and str(cand).isdigit() and 6 <= len(str(cand)) <= 15:
                                     if str(cand) != uid_str and str(cand) != own_acc:
                                         inviter = cand; break
-                            if inviter and group_id and _team_state["leader_uid"] != uid_str:
-                                print_premium(f"TEAM Invite from {inviter} → accept",
+                            if inviter and group_id and team_state["leader_uid"] != uid_str:
+                                print_premium(f"TEAM[{gid}] Invite from {inviter} → accept",
                                               color=PX.CYAN, icon=I["arrow"])
                                 for _ in range(2):
                                     try:
@@ -3137,13 +3182,13 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                                                  game_version=client_version)
                                         if writer and not writer.is_closing():
                                             writer.write(acc); await writer.drain()
-                                    except Exception as e: print_warning(f"TEAM accept err: {e}")
+                                    except Exception as e: print_warning(f"TEAM[{gid}] accept err: {e}")
                                     await asyncio.sleep(0.4)
-                        except Exception as e: print_warning(f"TEAM 0500 parse: {e}")
+                        except Exception as e: print_warning(f"TEAM[{gid}] 0500 parse: {e}")
                         continue
                     if hex_data.startswith("0300") and 10 < packet_length < 30: continue
                     if hex_data.startswith("0300") and packet_length >= 300:
-                        print_premium(f"Match Found | UID: {uid_str} | region={account_region}",
+                        print_premium(f"Match Found | UID: {uid_str} | squad={gid} | region={account_region}",
                                       color=PX.AMBER, icon=I["target"])
                         try: await _mark_match_found(uid_str)
                         except Exception: pass
@@ -3182,7 +3227,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                         client_version=client_version, access_token=acc_tok,
                                         mode_id=1, map_id=1)
                                 match_index = await _inc_match(uid_str)
-                                print_info(f"{'CS ' if CS_MODE_ENABLED else ''}Match #{match_index} → {server_ip_port}")
+                                print_info(f"{'CS ' if CS_MODE_ENABLED else ''}[{gid}] Match #{match_index} → {server_ip_port}")
                                 try:
                                     bot_state.increment_match_started()
                                     bot_state.update_status(uid_str, "IN_MATCH (CS)" if CS_MODE_ENABLED
@@ -3238,11 +3283,11 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 await asyncio.sleep(min(reconnects * 0.5, 2.0))
             finally:
                 _team_active["flag"] = False
-                async with _team_state["lock"]:
-                    _team_state["peers"].pop(uid_str, None)
-                    if _team_state["leader_uid"] == uid_str:
-                        _team_state["leader_uid"] = None
-                        _team_state["team_code"] = None
+                async with team_state["lock"]:
+                    team_state["peers"].pop(uid_str, None)
+                    if team_state["leader_uid"] == uid_str:
+                        team_state["leader_uid"] = None
+                        team_state["team_code"] = None
                 try: await _clear_team_joined(uid_str)
                 except Exception: pass
                 for tk in (team_coord_task, member_trigger_task):
@@ -3348,7 +3393,7 @@ async def refresh_account_profile(ad_or_uid):
         if aid not in bot_state.accounts:
             bot_state.register_account(aid, nickname or f"Player_{aid}",
                 region=ad.get('region','BD'), level=lvl, exp=exp,
-                auth_uid=ad.get('auth_uid'))
+                auth_uid=ad.get('auth_uid'), squad_id=ad.get('squad_id', 'A'))
             return
         old = bot_state.accounts[aid].get("current_exp", 0)
         bot_state.update_exp(aid, exp, lvl)
@@ -3357,18 +3402,20 @@ async def refresh_account_profile(ad_or_uid):
             print_premium(f"+{exp-old:,} EXP | {aid}", color=PX.GOLD, icon=I["spark"])
     except Exception: pass
 
-async def process_account_uid_pass(uid, password, region_override=None):
+async def process_account_uid_pass(uid, password, region_override=None, squad_id="A"):
+    squad = str(squad_id or "A").upper()
     cached = cache_get(uid)
     if cached:
         aid = str(cached['account_id'])
         nick = cached.get('nickname', f"Player_{aid}")
         lvl = cached.get('level', 1); expv = cached.get('exp', 0)
-        print_premium(f"Online (cache): {aid} | {nick} | region={cached.get('region','BD')}",
+        print_premium(f"Online (cache): {aid} | {nick} | region={cached.get('region','BD')} | squad={squad}",
                       color=PX.MINT, icon=I["check"])
         bot_state.register_account(aid, nick, cached.get('region','BD'),
-            lvl, expv, cached.get('likes',0), auth_uid=str(uid))
+            lvl, expv, cached.get('likes',0), auth_uid=str(uid), squad_id=squad)
+        cached['squad_id'] = squad
         _register_credentials(cached); return cached
-    print_info(f"LOGIN UID: {uid}")
+    print_info(f"LOGIN UID: {uid} (squad={squad})")
     try:
         async with _LOGIN_SEMAPHORE:
             vc = await version_config(region_override or "ID")
@@ -3402,8 +3449,9 @@ async def process_account_uid_pass(uid, password, region_override=None):
         nickname = _gf(4, f"Player_{acc_id_raw}") or f"Player_{acc_id_raw}"
         region = region_raw or _gf(3,"ID") or "ID"
         acc_id = str(acc_id_raw)
-        bot_state.register_account(acc_id, nickname, region, level, exp, likes, auth_uid=str(uid))
-        print_premium(f"Login: {acc_id} | {nickname} | Lvl {level} | region={region}",
+        bot_state.register_account(acc_id, nickname, region, level, exp, likes,
+                                   auth_uid=str(uid), squad_id=squad)
+        print_premium(f"Login: {acc_id} | {nickname} | Lvl {level} | region={region} | squad={squad}",
                       color=PX.GOLD, icon=I["gem"])
         ad = {'account_id':acc_id_raw,'nickname':nickname,'region':region,
             'level':level,'exp':exp,'likes':likes,'open_id':open_id,
@@ -3413,13 +3461,16 @@ async def process_account_uid_pass(uid, password, region_override=None):
             'functional_addrs':_gf(14),'informational_addrs':_gf(32),
             'release_version':release_version,'client_version':client_version,
             'server_url':server_url_raw,'login_payload_data':login_payload,
-            'auth_type':'guest','auth_uid':uid,'auth_password':password}
+            'auth_type':'guest','auth_uid':uid,'auth_password':password,
+            'squad_id': squad}
         _register_credentials(ad); cache_set(uid, ad); return ad
     except Exception as e:
         print_error(f"login err: {e}"); return None
 
-async def run_account_worker(ad, label, region_override=None, clan_override=None):
+async def run_account_worker(ad, label, region_override=None, clan_override=None, squad_id="A"):
     acc_id = str(ad['account_id'])
+    squad = str(squad_id or ad.get('squad_id', 'A') or 'A').upper()
+    ad['squad_id'] = squad
     info_task = None; exp_task = None
     try:
         reg = region_override or ad.get('region', 'BD')
@@ -3427,33 +3478,32 @@ async def run_account_worker(ad, label, region_override=None, clan_override=None
         # -------------------------------------------------------------
         # ধাপ ১: প্রোফাইল কাস্টমাইজেশন (Homer, Bio, Clan)
         # -------------------------------------------------------------
-        print_info(f"[{acc_id}] Setting up Homer & Skills...")
+        print_info(f"[{acc_id}][{squad}] Setting up Homer & Skills...")
         await equip_homer_async(ad['token'], ad['server_url'], ad.get('release_version', 'OB55'))
         await asyncio.sleep(1.0)
 
-        print_info(f"[{acc_id}] Updating Bio...")
+        print_info(f"[{acc_id}][{squad}] Updating Bio...")
         await change_bio(ad['token'], "[C][B]POWER OFF TORIKUL", ad['server_url'])
         await asyncio.sleep(1.0)
 
         if clan_override:
-            print_info(f"[{acc_id}] Joining Clan {clan_override}...")
+            print_info(f"[{acc_id}][{squad}] Joining Clan {clan_override}...")
             await join_clan(ad['token'], clan_override)
             await asyncio.sleep(1.0)
 
         # -------------------------------------------------------------
-        # ধাপ ২: অফলাইনে যাওয়া (Offline Pause)
+        # ধাপ ২: অফলাইনে যাওয়া (Offline Pause)
         # -------------------------------------------------------------
-        print_warning(f"[{acc_id}] Setup finished. Going OFFLINE for 5 seconds...")
+        print_warning(f"[{acc_id}][{squad}] Setup finished. Going OFFLINE for 3 seconds...")
         bot_state.update_status(acc_id, "OFFLINE")
-        await asyncio.sleep(3.0)  # ৫ সেকেন্ড অফলাইন থাকবে
+        await asyncio.sleep(3.0)
 
         # -------------------------------------------------------------
-        # ধাপ ৩: পুনরায় অনলাইনে আসা এবং আগের সব কাজ চালু করা
+        # ধাপ ৩: পুনরায় অনলাইনে আসা এবং আগের সব কাজ চালু করা
         # -------------------------------------------------------------
-        print_success(f"[{acc_id}] Back ONLINE! Starting TCP Gateway & Matchmaking...")
+        print_success(f"[{acc_id}][{squad}] Back ONLINE! Starting TCP Gateway & Matchmaking...")
         bot_state.update_status(acc_id, "ONLINE")
 
-        # TCP স্টার্টআপ প্যাকেট তৈরি
         tcp_online = await build_tcp_startup_packet(
             ad['account_id'], ad['token'], ad['server_time'],
             ad['aes_ak'], ad['iv_i'], region=reg, typ='OnLine')
@@ -3461,12 +3511,10 @@ async def run_account_worker(ad, label, region_override=None, clan_override=None
             ad['account_id'], ad['token'], ad['server_time'],
             ad['aes_ak'], ad['iv_i'], region=reg, typ='ChaT')
 
-        # ব্যাকগ্রাউন্ড ইনফরমেশনাল কানেকশন
         info_task = asyncio.create_task(informational(
             ad['informational_addrs'], tcp_chat, ad['aes_ak'], ad['iv_i'],
             region=reg, account_id=acc_id, account_data=ad))
 
-        # প্রতি ৯০ সেকেন্ড পর পর EXP রিফ্রেশার
         async def exp_refresher():
             while True:
                 await asyncio.sleep(90 + random.uniform(-10, 10))
@@ -3474,14 +3522,10 @@ async def run_account_worker(ad, label, region_override=None, clan_override=None
                 if fresh: await refresh_account_profile(fresh)
         exp_task = asyncio.create_task(exp_refresher())
 
-        # -------------------------------------------------------------
-        # ধাপ ৪ ও ৫: ৪ জনের স্কোয়াড তৈরি, ম্যাচমেকিং ও ইন-গেম খেলা
-        # -------------------------------------------------------------
-        # এটি স্বয়ংক্রিয়ভাবে টিমে ৪ জনকে যুক্ত করবে, CS/BR ম্যাচ স্টার্ট দেবে,
-        # এবং UDP-এর মাধ্যমে গেমে ঢুকে অটো-মুভমেন্ট ও হোমার স্কিল কাস্ট করবে।
         await functional_lone_wolf(
             ad['functional_addrs'], tcp_online, reg, ad['client_version'],
-            ad['aes_ak'], ad['iv_i'], account_id=acc_id, account_data=ad)
+            ad['aes_ak'], ad['iv_i'], account_id=acc_id, account_data=ad,
+            squad_id=squad)
 
     except asyncio.CancelledError:
         raise
@@ -3495,21 +3539,25 @@ async def run_account_worker(ad, label, region_override=None, clan_override=None
                 try: await t
                 except Exception: pass
 
-async def account_loop_guest(uid, password, region_override=None, clan_override=None):
+async def account_loop_guest(uid, password, region_override=None, clan_override=None, squad_id="A"):
     uid_str = str(uid)
+    squad = str(squad_id or "A").upper()
     bot_state.account_workers[uid_str] = asyncio.current_task()
     acc_id = None
     while True:
         try:
             bot_state.update_status(uid_str, "CONNECTING")
-            ad = await process_account_uid_pass(uid_str, password, region_override)
+            ad = await process_account_uid_pass(uid_str, password, region_override, squad_id=squad)
             if not ad:
                 print_error(f"Login failed {uid_str}. Retry 15s"); await asyncio.sleep(15); continue
+            ad['squad_id'] = squad
             acc_id = str(ad['account_id'])
+            if acc_id in bot_state.accounts:
+                bot_state.accounts[acc_id]['squad_id'] = squad
             bot_state.account_workers[acc_id] = asyncio.current_task()
             bot_state.auth_to_game_id[uid_str] = acc_id
             bot_state.game_to_auth_id[acc_id] = uid_str
-            await run_account_worker(ad, uid_str, region_override, clan_override)
+            await run_account_worker(ad, uid_str, region_override, clan_override, squad_id=squad)
             await asyncio.sleep(3)
         except asyncio.CancelledError:
             try:
@@ -3616,20 +3664,34 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
         lang = REGION_LANG.get(region.upper(), "en")
         game_version = remote_v or app_version
         _prog(f"Version OK | release={release_v} | game={game_version}")
-        
+
+        # --- Compute next free group letter (A, B, C...) ---
+        existing_groups = set()
+        for uid, acc in bot_state.accounts.items():
+            g = acc.get('squad_id')
+            if g: existing_groups.add(str(g).upper())
+        next_group_idx = 0
+        while chr(65 + next_group_idx) in existing_groups:
+            next_group_idx += 1
+        num_squads = (count + TEAM_SIZE - 1) // TEAM_SIZE
+        first_g = chr(65 + next_group_idx)
+        last_g = chr(65 + next_group_idx + num_squads - 1)
+        _prog(f"Splitting into {num_squads} squad(s) → Group {first_g}..{last_g}")
+
         created = []
         attempt = 0
 
-        # যতগুলো অ্যাকাউন্ট বলা হয়েছে ঠিক ততগুলো সফলভাবে তৈরি না হওয়া পর্যন্ত লুপ চলবে
+        # যতগুলো অ্যাকাউন্ট বলা হয়েছে ঠিক ততগুলো সফলভাবে তৈরি না হওয়া পর্যন্ত লুপ চলবে
         while len(created) < count:
             attempt += 1
             idx = len(created) + 1
-            
-            # ১. TORIKUL_{RANDOM} ফরম্যাটে ৬ অক্ষরের র‍্যান্ডম পাসওয়ার্ড তৈরি
+            squad_id = chr(65 + next_group_idx + ((idx - 1) // TEAM_SIZE))
+
+            # ১. TORIKUL_{RANDOM} ফরম্যাটে ৬ অক্ষরের র্যান্ডম পাসওয়ার্ড তৈরি
             rnd_suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
             acc_password = f"TORIKUL_{rnd_suffix}"
 
-            _prog(f"Creating bot {idx}/{count} (Attempt #{attempt}) | Pass: {acc_password}...")
+            _prog(f"Creating bot {idx}/{count} [Group {squad_id}] (Attempt #{attempt}) | Pass: {acc_password}...")
             try:
                 # রেজিস্টার
                 uid = await register_account(acc_password, gop_1, app_version)
@@ -3699,7 +3761,7 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                     await asyncio.sleep(3.0)
                     continue
 
-                # রিজিয়ন সিলেক্ট (প্রয়োজন হলে)
+                # রিজিয়ন সিলেক্ট (প্রয়োজন হলে)
                 if not server_url_raw:
                     _prog(f"   → ChooseRegion({region})...")
                     cr_status = await choose_region(region, jwt_token, login_url, release_v)
@@ -3760,19 +3822,20 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                     'release_version': release_v, 'client_version': game_version,
                     'server_url': server_url_raw, 'login_payload_data': login_payload,
                     'auth_type': 'guest', 'auth_uid': uid, 'auth_password': acc_password,
+                    'squad_id': squad_id,
                 }
                 _register_credentials(ad)
                 cache_set(uid, ad)
                 created.append(ad)
                 
-                _prog(f"✔ Bot {idx}/{count} Created: {nickname_final} | UID {acc_id_raw} | Pass: {acc_password}")
+                _prog(f"✔ Bot {idx}/{count} [Group {squad_id}] Created: {nickname_final} | UID {acc_id_raw} | Pass: {acc_password}")
                 await asyncio.sleep(1.0)
 
             except Exception as e:
                 _prog(f"Bot {idx} Error: {e}. Retrying...")
                 await asyncio.sleep(3.0)
 
-        # সব অ্যাকাউন্ট সফলভাবে তৈরি হওয়ার পর ফাইলে সেভ করা
+        # সব অ্যাকাউন্ট সফলভাবে তৈরি হওয়ার পর ফাইলে সেভ করা
         if created:
             try:
                 existing = []
@@ -3790,7 +3853,8 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                             "uid": u,
                             "password": a['auth_password'],
                             "region": region,
-                            "clan_id": clan_id
+                            "clan_id": clan_id,
+                            "squad_id": a.get('squad_id', 'A'),
                         })
                 with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
                     json.dump(existing, f, indent=2)
@@ -3798,16 +3862,19 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
             except Exception as e:
                 _prog(f"Save accounts error: {e}")
 
-        # বট ওয়ার্কার চালু করা
+        # বট ওয়ার্কার চালু করা
         if created:
             _prog(f"Starting {len(created)} bot workers...")
             for i, a in enumerate(created):
                 try:
+                    squad_id = a.get('squad_id') or chr(65 + next_group_idx + (i // TEAM_SIZE))
+                    a['squad_id'] = squad_id
                     task = asyncio.create_task(account_loop_guest(
                         str(a['auth_uid']), a['auth_password'],
-                        region_override=region, clan_override=clan_id))
+                        region_override=region, clan_override=clan_id,
+                        squad_id=squad_id))
                     bot_state.account_workers[str(a['auth_uid'])] = task
-                    _prog(f"   → Worker {i+1}/{len(created)} started")
+                    _prog(f"   → Worker {i+1}/{len(created)} [{squad_id}] started")
                     await asyncio.sleep(0.35)
                 except Exception as e:
                     _prog(f"   Worker {i+1} start error: {e}")
@@ -3842,11 +3909,13 @@ async def _autoload_accounts():
             password = str(a.get("password", "")).strip()
             region = str(a.get("region", "")).strip() or None
             clan_id = str(a.get("clan_id", "")).strip() or CLAN_ID_DEFAULT
+            squad_id = str(a.get("squad_id", "")).strip().upper() or _group_for_index(i)
             if not uid or not password: continue
             task = asyncio.create_task(account_loop_guest(
-                uid, password, region_override=region, clan_override=clan_id))
+                uid, password, region_override=region,
+                clan_override=clan_id, squad_id=squad_id))
             bot_state.account_workers[uid] = task
-            print_info(f"worker {uid} ({i+1}/{len(accounts)}) region={region}")
+            print_info(f"worker {uid} ({i+1}/{len(accounts)}) region={region} squad={squad_id}")
             await asyncio.sleep(0.5)
         except Exception as e:
             print_error(f"[BOOT] worker {i+1}: {e}")
@@ -3899,8 +3968,33 @@ async def api_stats(request):
                                  "message": str(l.get("message","")),
                                  "level": str(l.get("level","info"))})
             except Exception: continue
+
+        # ── Groups snapshot ──
+        groups_map = {}
+        for a in accs:
+            gid = str(a.get('squad_id', 'A') or 'A').upper()
+            if gid not in groups_map:
+                t = _get_team(gid)
+                groups_map[gid] = {
+                    "group": gid,
+                    "size": len(t["peers"]),
+                    "leader_uid": t["leader_uid"],
+                    "team_code": t["team_code"],
+                    "members": list(t["peers"].keys()),
+                    "account_count": 0,
+                    "in_match_count": 0,
+                }
+            groups_map[gid]["account_count"] += 1
+            if "IN_MATCH" in str(a.get("status", "")).upper():
+                groups_map[gid]["in_match_count"] += 1
+
+        teams_snap = _all_teams_snapshot()
+        first_team_code = teams_snap[0]["team_code"] if teams_snap else None
+        first_leader = teams_snap[0]["leader_uid"] if teams_snap else None
+
         data = {
             "accounts": accs, "logs": logs_out,
+            "groups": sorted(groups_map.values(), key=lambda x: x["group"]),
             "total_accounts": len(accs), "total_online": online,
             "total_matches": bot_state.total_matches,
             "total_matches_started": bot_state.matches_started,
@@ -3910,9 +4004,9 @@ async def api_stats(request):
             "matches_per_hour": matches_rate,
             "creating": bool(bot_state.creating),
             "create_progress": [str(x) for x in bot_state.create_progress[-40:]],
-            "team_code": _team_state.get("team_code"),
-            "leader_uid": _team_state.get("leader_uid"),
-            "team_size": len(_team_state["peers"]),
+            "team_code": first_team_code,
+            "leader_uid": first_leader,
+            "team_size": sum(len(t["peers"]) for t in _teams_state.values()),
             "restart_finished": len(_restart_state["finished_bots"]),
             "restart_target": _restart_state["target"],
             "restarting": _restart_state["restarting"],
@@ -3922,7 +4016,7 @@ async def api_stats(request):
     except Exception as e:
         traceback.print_exc()
         return aiohttp.web.Response(text=json.dumps({"error": str(e), "accounts": [],
-            "logs": [], "create_progress": [], "creating": False,
+            "logs": [], "groups": [], "create_progress": [], "creating": False,
             "total_accounts": 0, "total_matches_started": 0, "total_matches": 0,
             "total_active_matches": 0, "total_gained_exp": 0, "uptime": 1,
             "exp_per_hour": 0}), content_type="application/json", charset="utf-8")
@@ -3933,7 +4027,8 @@ async def api_state(request):
             "creating": bool(bot_state.creating),
             "create_progress": [str(x) for x in bot_state.create_progress[-40:]],
             "accounts": list(bot_state.accounts.values()),
-            "team_size": len(_team_state["peers"]),
+            "groups": _all_teams_snapshot(),
+            "team_size": sum(len(t["peers"]) for t in _teams_state.values()),
         }, default=str, ensure_ascii=False), content_type="application/json", charset="utf-8")
     except Exception as e:
         return aiohttp.web.Response(text=json.dumps({"error": str(e), "creating": False,
@@ -3961,9 +4056,11 @@ async def api_create_team(request):
             return aiohttp.web.json_response({"ok": False, "error": "clan_id required"})
         if bot_state.creating:
             return aiohttp.web.json_response({"ok": False, "error": "already creating"})
-        count = max(1, min(4, count))
+        count = max(1, min(16, count))
         asyncio.create_task(create_four_accounts(region, clan_id, count, password))
-        return aiohttp.web.json_response({"ok": True, "msg": f"creating {count} bots"})
+        squads = (count + TEAM_SIZE - 1) // TEAM_SIZE
+        return aiohttp.web.json_response({"ok": True,
+                                          "msg": f"creating {count} bots in {squads} squad(s)"})
     except Exception as e:
         traceback.print_exc()
         return aiohttp.web.json_response({"ok": False, "error": str(e)})
@@ -3971,17 +4068,18 @@ async def api_create_team(request):
 async def api_account_add(request):
     try:
         body = await request.json()
+        squad_id = _assign_squad_for_new_account()
         if body.get("token"):
             token = str(body["token"]).strip()
             if not token:
                 return aiohttp.web.json_response({"status": "error", "error": "empty token"})
-            asyncio.create_task(account_loop_token(token))
+            asyncio.create_task(account_loop_token(token, squad_id=squad_id))
             return aiohttp.web.json_response({"status": "ok"})
         uid = str(body.get("uid", "")).strip()
         password = str(body.get("password", "")).strip()
         if not uid or not password:
             return aiohttp.web.json_response({"status": "error", "error": "uid/password required"})
-        asyncio.create_task(account_loop_guest(uid, password))
+        asyncio.create_task(account_loop_guest(uid, password, squad_id=squad_id))
         return aiohttp.web.json_response({"status": "ok"})
     except Exception as e:
         return aiohttp.web.json_response({"status": "error", "error": str(e)})
@@ -4030,7 +4128,9 @@ async def api_account_restart(request):
                     accs = json.load(f)
                 for a in accs:
                     if str(a.get("uid")) in resolved and a.get("password"):
-                        t = asyncio.create_task(account_loop_guest(str(a["uid"]), a["password"]))
+                        squad_id = str(a.get("squad_id", "") or _assign_squad_for_new_account()).upper()
+                        t = asyncio.create_task(account_loop_guest(
+                            str(a["uid"]), a["password"], squad_id=squad_id))
                         bot_state.account_workers[str(a["uid"])] = t
                         break
         except Exception: pass
@@ -4077,8 +4177,8 @@ async def api_get_raw_accounts(request):
     except Exception as e:
         return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
 
-async def account_loop_token(token):
-    print_info(f"TOKEN Login {token[:20]}...")
+async def account_loop_token(token, squad_id="A"):
+    print_info(f"TOKEN Login {token[:20]}... (squad={squad_id})")
     try:
         vc = await version_config("ID")
         if not vc: return
@@ -4119,10 +4219,11 @@ async def account_loop_token(token):
             'informational_addrs':_gf_field(ld, 32),
             'release_version':release_version,'client_version':client_version,
             'server_url':server_url_raw,'login_payload_data':login_payload,
-            'auth_type':'token','auth_token':token}
+            'auth_type':'token','auth_token':token,
+            'squad_id': str(squad_id or "A").upper()}
         _register_credentials(ad)
         cache_set(f"tok_{token[:20]}", ad)
-        await run_account_worker(ad, str(acc_id_raw))
+        await run_account_worker(ad, str(acc_id_raw), squad_id=squad_id)
     except Exception as e:
         print_error(f"TOKEN {e}")
 
